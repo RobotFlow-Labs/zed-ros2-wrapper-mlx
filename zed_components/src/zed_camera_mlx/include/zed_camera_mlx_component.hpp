@@ -39,6 +39,9 @@
 // ---------- OpenCV (always available on macOS via Homebrew / conda) ----------
 #include <opencv2/core.hpp>
 
+// ---------- Open-capture bridge (camera + sensor access) ----------
+#include "sl_oc_bridge.hpp"
+
 // ---------- ROS2 headers -- gated so we can review without ROS2 installed ---
 #ifdef ZED_ROS2_AVAILABLE
 
@@ -50,7 +53,10 @@
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/temperature.hpp>
+#include <sensor_msgs/msg/magnetic_field.hpp>
+#include <sensor_msgs/msg/fluid_pressure.hpp>
 #include <diagnostic_updater/diagnostic_updater.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/static_transform_broadcaster.h>
 #include <tf2_ros/transform_broadcaster.h>
@@ -73,6 +79,8 @@ struct Image {};
 struct Imu {};
 struct PointCloud2 {};
 struct Temperature {};
+struct MagneticField {};
+struct FluidPressure {};
 }  // namespace sensor_msgs::msg
 
 namespace image_transport {
@@ -179,8 +187,10 @@ protected:
   void getSensorsParams();
   void getMlxParams();            ///< NEW: MLX-specific tuning knobs
 
-  // ---- TF frame names ----
+  // ---- TF frame names and publishing ----
   void setTFCoordFrameNames();
+  void publishStaticTFs();       ///< Publish static TFs (camera_link -> optical frames, imu_link)
+  void publishTFs();             ///< Publish dynamic TFs (map->odom->base_link, identity without SLAM)
 
   // ---- Camera lifecycle ----
   bool openCamera();              ///< Open via open-capture bridge
@@ -209,6 +219,9 @@ protected:
   void publishDepthMapWithInfo(const cv::Mat & depth);
   void publishPointCloud(const cv::Mat & depth, const cv::Mat & rgb);
   void publishImuData(const ImuSample & sample);
+  void publishMagnetometerData(const sl_oc_bridge::MagnetometerData & mag_data);
+  void publishTemperatureData(const sl_oc_bridge::TemperatureData & temp_data);
+  void publishBarometerData(const sl_oc_bridge::BarometerData & baro_data);
 
   // ---- Dynamic parameter callback ----
 #ifdef ZED_ROS2_AVAILABLE
@@ -236,7 +249,7 @@ private:
   // ===========================================================
 
   // ---- Bridge handles ----
-  std::shared_ptr<OpenCaptureHandle> mCaptureHandle;
+  std::unique_ptr<sl_oc_bridge::SlOcCamera> mSlCamera;
   ZedCalibration mCalib;
 
   uint64_t mFrameCount = 0;
@@ -287,6 +300,7 @@ private:
   // Point cloud
   bool mPublishPointcloud = true;
   double mPcPubRate = 10.0;
+  int mPcStride = 2;             ///< Point cloud decimation stride (1 = full, 2 = skip every other pixel)
 
   // Sensor
   bool mPublishImu = true;
@@ -365,6 +379,16 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr mPubImu;
   rclcpp::Publisher<sensor_msgs::msg::Temperature>::SharedPtr mPubImuTemp;
 
+  // ---- Magnetometer publisher ----
+  rclcpp::Publisher<sensor_msgs::msg::MagneticField>::SharedPtr mPubMag;
+
+  // ---- Barometer publisher ----
+  rclcpp::Publisher<sensor_msgs::msg::FluidPressure>::SharedPtr mPubBaro;
+
+  // ---- Camera temperature publishers (left/right CMOS) ----
+  rclcpp::Publisher<sensor_msgs::msg::Temperature>::SharedPtr mPubTempLeft;
+  rclcpp::Publisher<sensor_msgs::msg::Temperature>::SharedPtr mPubTempRight;
+
   // ---- TF ----
   std::unique_ptr<tf2_ros::Buffer> mTfBuffer;
   std::unique_ptr<tf2_ros::TransformListener> mTfListener;
@@ -408,8 +432,16 @@ private:
 #endif
   uint64_t mLastGrabTs_ns = 0;
 
+  // ---- Sensor data & timestamps for rate limiting ----
+  sl_oc_bridge::SensorsData mSensorsData;
+  uint64_t mLastImuTs_ns = 0;
+  uint64_t mLastMagTs_ns = 0;
+  uint64_t mLastTempTs_ns = 0;
+  uint64_t mLastBaroTs_ns = 0;
+
   // ---- Status flags ----
   bool mCameraOpen = false;
+  bool mStaticTfPublished = false;  ///< True after static TFs have been broadcast
 };
 
 }  // namespace stereolabs

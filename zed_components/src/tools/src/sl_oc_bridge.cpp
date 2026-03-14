@@ -32,6 +32,7 @@
 #include "defines.hpp"
 
 #include "sl_oc_bridge.hpp"
+#include "mlx_depth_bridge.hpp"
 
 #include <algorithm>
 #include <cassert>
@@ -40,6 +41,7 @@
 #include <cstring>
 #include <iostream>
 #include <mutex>
+#include <vector>
 
 namespace sl_oc_bridge {
 
@@ -253,6 +255,20 @@ struct SlOcCamera::Impl {
   // FPS measurement
   uint64_t fps_frame_count = 0;
   uint64_t fps_start_time_ns = 0;
+
+  // MLX depth bridge (optional, initialized via initMlxDepthBridge)
+  std::unique_ptr<mlx_depth_bridge::MlxDepthBridge> depth_bridge;
+
+  // Cached depth/disparity results from last successful read
+  std::vector<float> cached_depth_mm;
+  std::vector<float> cached_disparity;
+  uint32_t cached_depth_width = 0;
+  uint32_t cached_depth_height = 0;
+  uint64_t cached_depth_frame_id = 0;
+
+  // Grayscale buffers for submitting to MLX bridge
+  std::vector<uint8_t> left_gray_buf;
+  std::vector<uint8_t> right_gray_buf;
 
   // ----> Helper: map our RESOLUTION_PRESET to sl_oc values
   sl_oc::video::RESOLUTION mapResolution(RESOLUTION_PRESET r) const {
@@ -516,6 +532,38 @@ ERROR_CODE SlOcCamera::grab(const RuntimeParameters& /*params*/) {
 
     pImpl_->mat_left_bgra.timestamp = pImpl_->last_grab_ts;
     pImpl_->mat_right_bgra.timestamp = pImpl_->last_grab_ts;
+  }
+
+  // Submit stereo frames to MLX depth bridge (if active)
+  if (pImpl_->depth_bridge && pImpl_->depth_bridge->isInitialized()) {
+    // Extract grayscale from BGRA (BT.601 luma: 0.114*B + 0.587*G + 0.299*R)
+    const size_t pixels = eye_w * eye_h;
+    if (pImpl_->left_gray_buf.size() < pixels) {
+      pImpl_->left_gray_buf.resize(pixels);
+      pImpl_->right_gray_buf.resize(pixels);
+    }
+
+    auto bgra_to_gray = [](const uint8_t* bgra, uint8_t* gray, size_t count) {
+      for (size_t i = 0; i < count; ++i) {
+        // BGRA layout: B=bgra[0], G=bgra[1], R=bgra[2], A=bgra[3]
+        uint32_t b = bgra[i * 4 + 0];
+        uint32_t g = bgra[i * 4 + 1];
+        uint32_t r = bgra[i * 4 + 2];
+        // Integer BT.601: (77*R + 150*G + 29*B + 128) >> 8
+        gray[i] = static_cast<uint8_t>((77 * r + 150 * g + 29 * b + 128) >> 8);
+      }
+    };
+
+    bgra_to_gray(pImpl_->mat_left_bgra.getPtr(), pImpl_->left_gray_buf.data(), pixels);
+    bgra_to_gray(pImpl_->mat_right_bgra.getPtr(), pImpl_->right_gray_buf.data(), pixels);
+
+    pImpl_->depth_bridge->submitStereoFrame(
+        pImpl_->left_gray_buf.data(),
+        pImpl_->right_gray_buf.data(),
+        static_cast<uint32_t>(eye_w),
+        static_cast<uint32_t>(eye_h),
+        frame.frame_id,
+        frame.timestamp);
   }
 
   // Update FPS measurement
@@ -805,6 +853,121 @@ bool SlOcCamera::getLED() const {
   bool status = false;
   pImpl_->video->getLEDstatus(&status);
   return status;
+}
+
+// ============================================================================
+// MLX Depth Bridge
+// ============================================================================
+
+bool SlOcCamera::initMlxDepthBridge(const std::string& shmInName,
+                                     const std::string& shmOutName) {
+  if (!pImpl_->opened) {
+    std::cerr << "[sl_oc_bridge] Cannot init MLX depth bridge before camera is opened."
+              << std::endl;
+    return false;
+  }
+
+  pImpl_->depth_bridge = std::make_unique<mlx_depth_bridge::MlxDepthBridge>(
+      shmInName, shmOutName);
+
+  if (!pImpl_->depth_bridge->initialize()) {
+    std::cerr << "[sl_oc_bridge] Failed to initialize MLX depth bridge." << std::endl;
+    pImpl_->depth_bridge.reset();
+    return false;
+  }
+
+  std::cout << "[sl_oc_bridge] MLX depth bridge initialized."
+            << " stereo_in=" << shmInName
+            << " depth_out=" << shmOutName << std::endl;
+  return true;
+}
+
+bool SlOcCamera::isMlxDepthBridgeActive() const {
+  return pImpl_->depth_bridge && pImpl_->depth_bridge->isInitialized();
+}
+
+ERROR_CODE SlOcCamera::retrieveMeasure(Mat& mat, int measure, MEM /*mem*/,
+                                       Resolution /*res*/) {
+  if (!pImpl_->opened) {
+    return ERROR_CODE::CAMERA_NOT_INITIALIZED;
+  }
+
+  // Check if the MLX depth bridge is active
+  if (!pImpl_->depth_bridge || !pImpl_->depth_bridge->isInitialized()) {
+    // No bridge -- fall back to NOT_SUPPORTED
+    std::cerr << "[sl_oc_bridge] WARNING: retrieveMeasure requires MLX depth bridge. "
+              << "Call initMlxDepthBridge() after open(), and start mlx_depth_worker.py."
+              << std::endl;
+    return ERROR_CODE::NOT_SUPPORTED;
+  }
+
+  // Try to read the latest depth result from SHM
+  uint32_t w = 0, h = 0;
+  uint64_t fid = 0;
+
+  // Allocate temporary read buffers if needed
+  size_t maxPixels = pImpl_->cam_info.camera_resolution.width *
+                     pImpl_->cam_info.camera_resolution.height;
+  if (pImpl_->cached_depth_mm.size() < maxPixels) {
+    pImpl_->cached_depth_mm.resize(maxPixels);
+    pImpl_->cached_disparity.resize(maxPixels);
+  }
+
+  // Non-blocking read -- updates cached results if new data available
+  pImpl_->depth_bridge->getDepthResult(
+      pImpl_->cached_depth_mm.data(),
+      pImpl_->cached_disparity.data(),
+      w, h, fid);
+
+  // Use cached results (even if no new frame, return the last known)
+  if (pImpl_->cached_depth_frame_id == 0 && fid == 0) {
+    // No depth result has ever been received
+    return ERROR_CODE::FAILURE;
+  }
+
+  // Update cache if new result was available
+  if (fid > pImpl_->cached_depth_frame_id) {
+    pImpl_->cached_depth_width = w;
+    pImpl_->cached_depth_height = h;
+    pImpl_->cached_depth_frame_id = fid;
+  }
+
+  w = pImpl_->cached_depth_width;
+  h = pImpl_->cached_depth_height;
+
+  if (w == 0 || h == 0) {
+    return ERROR_CODE::FAILURE;
+  }
+
+  // measure: 0 = DEPTH (float32), 1 = DISPARITY (float32)
+  const float* srcData = nullptr;
+  if (measure == 0) {
+    // DEPTH: convert from mm to meters for ROS2 convention
+    srcData = pImpl_->cached_depth_mm.data();
+  } else if (measure == 1) {
+    // DISPARITY: raw disparity in pixels
+    srcData = pImpl_->cached_disparity.data();
+  } else {
+    std::cerr << "[sl_oc_bridge] Unsupported measure type: " << measure << std::endl;
+    return ERROR_CODE::NOT_SUPPORTED;
+  }
+
+  // Allocate/resize the output Mat
+  mat.alloc(w, h, MAT_TYPE::F32_C1);
+  float* dst = mat.getPtr<float>();
+
+  if (measure == 0) {
+    // Convert depth from mm to meters
+    for (size_t i = 0; i < static_cast<size_t>(w) * h; ++i) {
+      dst[i] = srcData[i] / 1000.0f;
+    }
+  } else {
+    // Copy disparity as-is
+    std::memcpy(dst, srcData, static_cast<size_t>(w) * h * sizeof(float));
+  }
+
+  mat.timestamp = Timestamp(pImpl_->cached_depth_frame_id);
+  return ERROR_CODE::SUCCESS;
 }
 
 }  // namespace sl_oc_bridge

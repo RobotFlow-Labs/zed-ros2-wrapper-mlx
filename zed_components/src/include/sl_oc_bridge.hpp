@@ -43,6 +43,7 @@
 #include <mutex>
 
 #include "macos_unsupported.hpp"
+#include "mlx_depth_bridge.hpp"
 
 // Include zed-open-capture headers directly. The forward-declaration approach
 // caused incomplete-type errors because enum class forward declarations require
@@ -589,16 +590,41 @@ public:
   ERROR_CODE getPosition(Pose& /*pose*/, int /*reference_frame*/ = 0) {
     SL_OC_UNSUPPORTED(unsupported::Feature::POSITIONAL_TRACKING);
   }
-  ERROR_CODE retrieveMeasure(Mat& /*mat*/, int /*measure*/ = 0, MEM /*mem*/ = MEM::CPU,
-                             Resolution /*res*/ = Resolution()) {
-    // Depth measure could be supported via MLX in the future;
-    // for now, gate it unless depth_mode is PERFORMANCE or QUALITY
-    SL_OC_UNSUPPORTED(unsupported::Feature::NEURAL_DEPTH);
-  }
+  // ----> MLX Depth via shared memory bridge
+  // retrieveMeasure() for DEPTH is now supported when the MlxDepthBridge is
+  // active (mlx_depth_worker.py running alongside this node).
+  //
+  // IMPORTANT: The depth result is ASYNCHRONOUS. Because the MLX stereo
+  // pipeline runs in a separate Python process, the depth map returned here
+  // may lag 1-2 frames behind the most recent grab(). The frame_id embedded
+  // in the returned Mat's timestamp indicates which capture frame the depth
+  // corresponds to. Callers should be aware of this latency.
+  //
+  // measure values: 0 = DEPTH (float32 depth in meters)
+  //                 1 = DISPARITY (float32 raw disparity in pixels)
+  //
+  // When no MLX bridge is active (or no depth result is available yet),
+  // this returns NOT_SUPPORTED / FAILURE respectively.
+  ERROR_CODE retrieveMeasure(Mat& mat, int measure = 0, MEM mem = MEM::CPU,
+                             Resolution res = Resolution());
   ERROR_CODE findPlaneAtHit(/* params */) {
     SL_OC_UNSUPPORTED(unsupported::Feature::PLANE_DETECTION);
   }
   // <---- Unsupported features
+
+  // ----> MLX Depth Bridge lifecycle
+  /// Initialize the bidirectional SHM bridge for MLX depth computation.
+  /// Call this after open() to enable retrieveMeasure(DEPTH/DISPARITY).
+  /// The Python mlx_depth_worker.py must be started separately.
+  /// @param shmInName   SHM name for stereo input  (default: "zed_ros2_stereo_in")
+  /// @param shmOutName  SHM name for depth output   (default: "zed_ros2_depth_out")
+  /// @return true if the bridge was initialized successfully
+  bool initMlxDepthBridge(const std::string& shmInName  = "zed_ros2_stereo_in",
+                          const std::string& shmOutName = "zed_ros2_depth_out");
+
+  /// Check whether the MLX depth bridge is active.
+  bool isMlxDepthBridgeActive() const;
+  // <---- MLX Depth Bridge lifecycle
 
   // ----> SDK version compatibility
   static std::string getSDKVersion() { return "0.6.0-oc-bridge"; }

@@ -420,6 +420,7 @@ else()
     add_library(sl_oc_bridge SHARED
         ${CMAKE_CURRENT_SOURCE_DIR}/src/tools/src/sl_win_avg.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/tools/src/sl_oc_bridge.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/tools/src/mlx_depth_bridge.cpp
     )
     # MLX-CHANGE: sl_types.cpp excluded from standalone build because
     # sl_types.hpp includes sl/Camera.hpp (proprietary ZED SDK).

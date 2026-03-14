@@ -41,6 +41,7 @@
 #include <sensor_msgs/msg/point_field.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <sensor_msgs/image_encodings.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
 #endif
 
 using namespace std::chrono_literals;
@@ -109,6 +110,15 @@ void ZedCameraMlx::initNode()
 
   // 4. Publishers
   initPublishers();
+
+  // 4b. TF broadcasters
+#ifdef ZED_ROS2_AVAILABLE
+  mTfBuffer = std::make_unique<tf2_ros::Buffer>(get_clock());
+  mTfListener = std::make_unique<tf2_ros::TransformListener>(*mTfBuffer);
+  mStaticTfBroadcaster = std::make_unique<tf2_ros::StaticTransformBroadcaster>(this);
+  mTfBroadcaster = std::make_unique<tf2_ros::TransformBroadcaster>(this);
+  RCLCPP_INFO(get_logger(), "=== TF BROADCASTERS initialised ===");
+#endif
 
   // 5. Open camera via open-capture bridge
   if (!openCamera()) {
@@ -276,24 +286,166 @@ void ZedCameraMlx::getMlxParams()
 void ZedCameraMlx::setTFCoordFrameNames()
 {
 #ifdef ZED_ROS2_AVAILABLE
+  // Fixed world frames (no SLAM, so these are global)
+  mMapFrameId = "map";
+  mOdomFrameId = "odom";
+
+  // Camera-prefixed frames
   mBaseFrameId = mCameraName + "_base_link";
   mCenterFrameId = mCameraName + "_camera_center";
   mLeftCamFrameId = mCameraName + "_left_camera_frame";
-  mLeftCamOptFrameId = mCameraName + "_left_camera_frame_optical";
+  mLeftCamOptFrameId = mCameraName + "_left_camera_optical_frame";
   mRightCamFrameId = mCameraName + "_right_camera_frame";
-  mRightCamOptFrameId = mCameraName + "_right_camera_frame_optical";
+  mRightCamOptFrameId = mCameraName + "_right_camera_optical_frame";
   mImuFrameId = mCameraName + "_imu_link";
   mDepthFrameId = mLeftCamFrameId;
   mDepthOptFrameId = mLeftCamOptFrameId;
-  mPointCloudFrameId = mDepthFrameId;
+  mPointCloudFrameId = mLeftCamOptFrameId;
 
   RCLCPP_INFO(get_logger(), "=== TF FRAMES ===");
+  RCLCPP_INFO_STREAM(get_logger(), " * Map\t\t-> " << mMapFrameId);
+  RCLCPP_INFO_STREAM(get_logger(), " * Odom\t\t-> " << mOdomFrameId);
   RCLCPP_INFO_STREAM(get_logger(), " * Base\t\t-> " << mBaseFrameId);
   RCLCPP_INFO_STREAM(get_logger(), " * Camera\t-> " << mCenterFrameId);
   RCLCPP_INFO_STREAM(get_logger(), " * Left\t\t-> " << mLeftCamFrameId);
+  RCLCPP_INFO_STREAM(get_logger(), " * Left Opt\t-> " << mLeftCamOptFrameId);
   RCLCPP_INFO_STREAM(get_logger(), " * Right\t\t-> " << mRightCamFrameId);
+  RCLCPP_INFO_STREAM(get_logger(), " * Right Opt\t-> " << mRightCamOptFrameId);
   RCLCPP_INFO_STREAM(get_logger(), " * Depth\t\t-> " << mDepthFrameId);
   RCLCPP_INFO_STREAM(get_logger(), " * IMU\t\t-> " << mImuFrameId);
+  RCLCPP_INFO_STREAM(get_logger(), " * Point Cloud\t-> " << mPointCloudFrameId);
+#endif
+}
+
+// ===========================================================================
+// publishStaticTFs  --  one-shot static transforms
+// ===========================================================================
+
+void ZedCameraMlx::publishStaticTFs()
+{
+#ifdef ZED_ROS2_AVAILABLE
+  if (!mStaticTfBroadcaster) {
+    return;
+  }
+
+  std::vector<geometry_msgs::msg::TransformStamped> static_transforms;
+  auto stamp = now();
+
+  // --- Helper: create an identity TransformStamped ---
+  auto makeIdentityTF = [&](const std::string & parent,
+                            const std::string & child) -> geometry_msgs::msg::TransformStamped {
+    geometry_msgs::msg::TransformStamped tf;
+    tf.header.stamp = stamp;
+    tf.header.frame_id = parent;
+    tf.child_frame_id = child;
+    tf.transform.translation.x = 0.0;
+    tf.transform.translation.y = 0.0;
+    tf.transform.translation.z = 0.0;
+    tf.transform.rotation.x = 0.0;
+    tf.transform.rotation.y = 0.0;
+    tf.transform.rotation.z = 0.0;
+    tf.transform.rotation.w = 1.0;
+    return tf;
+  };
+
+  // --- Static TF: camera_center -> left_camera_optical_frame ---
+  // Standard ROS2 optical frame convention:
+  //   Camera frame:  X-right, Y-down, Z-forward
+  //   Optical frame: X-right, Y-down, Z-forward (after rotation)
+  // The rotation from camera_link to optical frame is:
+  //   R = Ry(-pi/2) * Rz(-pi/2)
+  // Quaternion: (x=-0.5, y=0.5, z=-0.5, w=0.5)
+  {
+    auto tf = makeIdentityTF(mCenterFrameId, mLeftCamOptFrameId);
+    tf.transform.rotation.x = -0.5;
+    tf.transform.rotation.y =  0.5;
+    tf.transform.rotation.z = -0.5;
+    tf.transform.rotation.w =  0.5;
+    static_transforms.push_back(tf);
+  }
+
+  // --- Static TF: camera_center -> right_camera_optical_frame ---
+  // Same rotation as left, but offset by baseline along the X axis
+  {
+    auto tf = makeIdentityTF(mCenterFrameId, mRightCamOptFrameId);
+    tf.transform.translation.x = -mCalib.baseline_m;  // right cam offset in negative X
+    tf.transform.rotation.x = -0.5;
+    tf.transform.rotation.y =  0.5;
+    tf.transform.rotation.z = -0.5;
+    tf.transform.rotation.w =  0.5;
+    static_transforms.push_back(tf);
+  }
+
+  // --- Static TF: camera_center -> left_camera_frame (physical frame, no rotation) ---
+  {
+    auto tf = makeIdentityTF(mCenterFrameId, mLeftCamFrameId);
+    static_transforms.push_back(tf);
+  }
+
+  // --- Static TF: camera_center -> right_camera_frame (offset by baseline) ---
+  {
+    auto tf = makeIdentityTF(mCenterFrameId, mRightCamFrameId);
+    tf.transform.translation.x = -mCalib.baseline_m;
+    static_transforms.push_back(tf);
+  }
+
+  // --- Static TF: camera_center -> imu_link ---
+  // Small offset between camera center and IMU; use identity for now.
+  // TODO(mlx-port): Use actual camera-to-IMU extrinsic from ZED factory calibration.
+  {
+    auto tf = makeIdentityTF(mCenterFrameId, mImuFrameId);
+    static_transforms.push_back(tf);
+  }
+
+  mStaticTfBroadcaster->sendTransform(static_transforms);
+  RCLCPP_INFO(get_logger(),
+    "Published %zu static TF transforms", static_transforms.size());
+#endif
+}
+
+// ===========================================================================
+// publishTFs  --  per-frame dynamic transforms (identity without SLAM)
+// ===========================================================================
+
+void ZedCameraMlx::publishTFs()
+{
+#ifdef ZED_ROS2_AVAILABLE
+  if (!mTfBroadcaster) {
+    return;
+  }
+
+  auto stamp = now();
+
+  auto makeIdentityTF = [&](const std::string & parent,
+                            const std::string & child) -> geometry_msgs::msg::TransformStamped {
+    geometry_msgs::msg::TransformStamped tf;
+    tf.header.stamp = stamp;
+    tf.header.frame_id = parent;
+    tf.child_frame_id = child;
+    tf.transform.translation.x = 0.0;
+    tf.transform.translation.y = 0.0;
+    tf.transform.translation.z = 0.0;
+    tf.transform.rotation.x = 0.0;
+    tf.transform.rotation.y = 0.0;
+    tf.transform.rotation.z = 0.0;
+    tf.transform.rotation.w = 1.0;
+    return tf;
+  };
+
+  std::vector<geometry_msgs::msg::TransformStamped> transforms;
+
+  // map -> odom: identity (no SLAM drift correction)
+  transforms.push_back(makeIdentityTF(mMapFrameId, mOdomFrameId));
+
+  // odom -> base_link: identity (no odometry / wheel encoders)
+  transforms.push_back(makeIdentityTF(mOdomFrameId, mBaseFrameId));
+
+  // base_link -> camera_center: identity (URDF typically handles this,
+  // but we publish it here as fallback since robot_state_publisher may not
+  // be running in a standalone camera setup)
+  transforms.push_back(makeIdentityTF(mBaseFrameId, mCenterFrameId));
+
+  mTfBroadcaster->sendTransform(transforms);
 #endif
 }
 
@@ -351,6 +503,29 @@ void ZedCameraMlx::initPublishers()
     mPubImuTemp = create_publisher<sensor_msgs::msg::Temperature>(temp_topic, mQos);
     RCLCPP_INFO_STREAM(get_logger(),
       " * Advertised on topic: " << mPubImuTemp->get_topic_name());
+
+    // ---- Magnetometer publisher ----
+    std::string mag_topic = mTopicRoot + "imu/mag";
+    mPubMag = create_publisher<sensor_msgs::msg::MagneticField>(mag_topic, mQos);
+    RCLCPP_INFO_STREAM(get_logger(),
+      " * Advertised on topic: " << mPubMag->get_topic_name());
+
+    // ---- Barometer publisher ----
+    std::string baro_topic = mTopicRoot + "atm_press";
+    mPubBaro = create_publisher<sensor_msgs::msg::FluidPressure>(baro_topic, mQos);
+    RCLCPP_INFO_STREAM(get_logger(),
+      " * Advertised on topic: " << mPubBaro->get_topic_name());
+
+    // ---- Camera CMOS temperature publishers ----
+    std::string temp_left_topic = mTopicRoot + "temperature/left";
+    mPubTempLeft = create_publisher<sensor_msgs::msg::Temperature>(temp_left_topic, mQos);
+    RCLCPP_INFO_STREAM(get_logger(),
+      " * Advertised on topic: " << mPubTempLeft->get_topic_name());
+
+    std::string temp_right_topic = mTopicRoot + "temperature/right";
+    mPubTempRight = create_publisher<sensor_msgs::msg::Temperature>(temp_right_topic, mQos);
+    RCLCPP_INFO_STREAM(get_logger(),
+      " * Advertised on topic: " << mPubTempRight->get_topic_name());
   }
 
   // ---- Unsupported upstream publishers ----
@@ -506,31 +681,95 @@ void ZedCameraMlx::initThreads()
 
 bool ZedCameraMlx::openCamera()
 {
-  // TODO(mlx-port): Implement camera open using the open-capture bridge.
-  //
-  // Pseudocode:
-  //   #include <open_capture_bridge.hpp>
-  //   mCaptureHandle = open_capture::open(mCamSerialNumber, mCamWidth,
-  //                                        mCamHeight, mCamGrabFrameRate);
-  //   if (!mCaptureHandle) return false;
-  //   mCameraOpen = true;
-  //   return true;
-  //
-  // The open-capture bridge wraps libusb / UVC to open the ZED as a
-  // standard stereo USB camera on macOS.
+  // Create the SlOcCamera instance and configure InitParameters
+  mSlCamera = std::make_unique<sl_oc_bridge::SlOcCamera>();
+
+  sl_oc_bridge::InitParameters init_params;
+  init_params.camera_resolution = sl_oc_bridge::RESOLUTION_PRESET::HD720;
+  init_params.camera_fps = mCamGrabFrameRate;
+  init_params.camera_device_id = -1;  // auto-detect
+  init_params.depth_minimum_distance = static_cast<float>(mCamMinDepth);
+  init_params.depth_maximum_distance = static_cast<float>(mCamMaxDepth);
+
+  // If a serial number filter was configured, apply it
+  if (mCamSerialNumber > 0) {
+    init_params.serial_number_filter = mCamSerialNumber;
+  }
+
+  // If an OpenCV calibration file was specified, pass it through
+  if (!mOpencvCalibFile.empty()) {
+    init_params.opencv_calibration_file = mOpencvCalibFile;
+  }
+
+  sl_oc_bridge::ERROR_CODE err = mSlCamera->open(init_params);
+
+  if (err != sl_oc_bridge::ERROR_CODE::SUCCESS) {
+#ifdef ZED_ROS2_AVAILABLE
+    RCLCPP_ERROR(get_logger(),
+      "SlOcCamera::open() failed: %s", sl_oc_bridge::toString(err));
+#else
+    std::cerr << "[ZedCameraMlx] SlOcCamera::open() failed: "
+              << sl_oc_bridge::toString(err) << std::endl;
+#endif
+    mSlCamera.reset();
+    mCameraOpen = false;
+    return false;
+  }
+
+  // Read back actual resolution from the camera
+  sl_oc_bridge::CameraInformation cam_info = mSlCamera->getCameraInformation();
+  mCamWidth = static_cast<int>(cam_info.camera_resolution.width);
+  mCamHeight = static_cast<int>(cam_info.camera_resolution.height);
+  mCamSerialNumber = cam_info.serial_number;
+
+  // Populate calibration struct from camera info
+  const auto& cal = cam_info.camera_configuration;
+  mCalib.left_fx = cal.left_cam.fx;
+  mCalib.left_fy = cal.left_cam.fy;
+  mCalib.left_cx = cal.left_cam.cx;
+  mCalib.left_cy = cal.left_cam.cy;
+  mCalib.right_fx = cal.right_cam.fx;
+  mCalib.right_fy = cal.right_cam.fy;
+  mCalib.right_cx = cal.right_cam.cx;
+  mCalib.right_cy = cal.right_cam.cy;
+  mCalib.baseline_m = cal.baseline;
+
+  // Store distortion coefficients (up to 12 from CameraParameters::disto)
+  mCalib.left_distortion.assign(cal.left_cam.disto, cal.left_cam.disto + 12);
+  mCalib.right_distortion.assign(cal.right_cam.disto, cal.right_cam.disto + 12);
+
+  // Apply initial camera settings
+  if (mCamAutoExpGain) {
+    mSlCamera->setAutoExposureGain(true);
+  } else {
+    mSlCamera->setAutoExposureGain(false);
+    mSlCamera->setExposure(mCamExposure);
+    mSlCamera->setGain(mCamGain);
+  }
+  mSlCamera->setBrightness(mCamBrightness);
+  mSlCamera->setContrast(mCamContrast);
+
+  mCameraOpen = true;
 
 #ifdef ZED_ROS2_AVAILABLE
-  RCLCPP_WARN(get_logger(),
-    "TODO(mlx-port): openCamera() -- open-capture bridge not yet implemented");
+  RCLCPP_INFO(get_logger(),
+    "Camera opened: serial=%d, resolution=%dx%d, fps=%d",
+    mCamSerialNumber, mCamWidth, mCamHeight, mCamGrabFrameRate);
+#else
+  std::cout << "[ZedCameraMlx] Camera opened: serial=" << mCamSerialNumber
+            << " resolution=" << mCamWidth << "x" << mCamHeight
+            << " fps=" << mCamGrabFrameRate << std::endl;
 #endif
-  mCameraOpen = false;  // Will become true once bridge is implemented
-  return true;           // Return true for skeleton testing
+
+  return true;
 }
 
 void ZedCameraMlx::closeCamera()
 {
-  // TODO(mlx-port): Close the open-capture handle.
-  //   if (mCaptureHandle) { open_capture::close(mCaptureHandle); }
+  if (mSlCamera) {
+    mSlCamera->close();
+    mSlCamera.reset();
+  }
   mCameraOpen = false;
 }
 
@@ -571,30 +810,88 @@ bool ZedCameraMlx::loadCalibration()
 
 void ZedCameraMlx::fillCamInfo(bool rawParam)
 {
-  // TODO(mlx-port): Populate mLeftCamInfoMsg / mRightCamInfoMsg from mCalib.
-  //
-  // This mirrors the upstream fillCamInfo() but reads from our ZedCalibration
-  // struct instead of sl::CalibrationParameters.
-  //
-  // Key fields to fill:
-  //   msg->distortion_model = "rational_polynomial" or "plumb_bob"
-  //   msg->d = { k1, k2, p1, p2, k3 [, k4, k5, k6] }
-  //   msg->k = { fx, 0, cx, 0, fy, cy, 0, 0, 1 }
-  //   msg->r = 3x3 identity (rectified) or rotation (raw)
-  //   msg->p = 3x4 projection matrix
-  //   msg->width  = mCamWidth
-  //   msg->height = mCamHeight
-  //   msg->header.frame_id = left/right optical frame
-
 #ifdef ZED_ROS2_AVAILABLE
+  auto fillMsg = [&](
+    sensor_msgs::msg::CameraInfo::SharedPtr & msg,
+    double fx, double fy, double cx, double cy,
+    const std::vector<double> & distortion,
+    const std::string & frameId,
+    double baseline_fx)  // Tx component of projection matrix: -fx * baseline (for right cam)
+  {
+    msg = std::make_shared<sensor_msgs::msg::CameraInfo>();
+
+    msg->width = static_cast<uint32_t>(mCamWidth);
+    msg->height = static_cast<uint32_t>(mCamHeight);
+    msg->header.frame_id = frameId;
+
+    // Distortion model
+    if (rawParam && distortion.size() > 5) {
+      msg->distortion_model = "rational_polynomial";
+    } else {
+      msg->distortion_model = "plumb_bob";
+    }
+
+    // Distortion coefficients: k1, k2, p1, p2, k3 [, k4, k5, k6]
+    if (rawParam) {
+      // For raw, include actual distortion
+      size_t n = std::min(distortion.size(), static_cast<size_t>(8));
+      msg->d.resize(n);
+      for (size_t i = 0; i < n; ++i) {
+        msg->d[i] = distortion[i];
+      }
+    } else {
+      // For rectified, distortion is zero
+      msg->d.assign(5, 0.0);
+    }
+
+    // Intrinsic camera matrix K (3x3 row-major)
+    msg->k = {
+      fx, 0.0, cx,
+      0.0, fy, cy,
+      0.0, 0.0, 1.0
+    };
+
+    // Rectification matrix R (3x3 identity for rectified; identity placeholder for raw)
+    msg->r = {
+      1.0, 0.0, 0.0,
+      0.0, 1.0, 0.0,
+      0.0, 0.0, 1.0
+    };
+
+    // Projection matrix P (3x4)
+    // For left camera: P = [fx 0 cx 0; 0 fy cy 0; 0 0 1 0]
+    // For right camera: P = [fx 0 cx Tx; 0 fy cy 0; 0 0 1 0]  where Tx = -fx * baseline
+    msg->p = {
+      fx, 0.0, cx, baseline_fx,
+      0.0, fy, cy, 0.0,
+      0.0, 0.0, 1.0, 0.0
+    };
+  };
+
   if (rawParam) {
-    mLeftCamInfoRawMsg = std::make_shared<sensor_msgs::msg::CameraInfo>();
-    mRightCamInfoRawMsg = std::make_shared<sensor_msgs::msg::CameraInfo>();
-    // TODO(mlx-port): Fill raw camera info from mCalib (unrectified intrinsics)
+    fillMsg(mLeftCamInfoRawMsg,
+      mCalib.left_fx, mCalib.left_fy, mCalib.left_cx, mCalib.left_cy,
+      mCalib.left_distortion,
+      mLeftCamOptFrameId,
+      0.0);
+
+    fillMsg(mRightCamInfoRawMsg,
+      mCalib.right_fx, mCalib.right_fy, mCalib.right_cx, mCalib.right_cy,
+      mCalib.right_distortion,
+      mRightCamOptFrameId,
+      -mCalib.right_fx * mCalib.baseline_m);
   } else {
-    mLeftCamInfoMsg = std::make_shared<sensor_msgs::msg::CameraInfo>();
-    mRightCamInfoMsg = std::make_shared<sensor_msgs::msg::CameraInfo>();
-    // TODO(mlx-port): Fill rectified camera info from mCalib
+    fillMsg(mLeftCamInfoMsg,
+      mCalib.left_fx, mCalib.left_fy, mCalib.left_cx, mCalib.left_cy,
+      mCalib.left_distortion,
+      mLeftCamOptFrameId,
+      0.0);
+
+    fillMsg(mRightCamInfoMsg,
+      mCalib.right_fx, mCalib.right_fy, mCalib.right_cx, mCalib.right_cy,
+      mCalib.right_distortion,
+      mRightCamOptFrameId,
+      -mCalib.right_fx * mCalib.baseline_m);
   }
 #endif
 }
@@ -627,38 +924,61 @@ void ZedCameraMlx::threadFunc_grab()
     auto grab_start = std::chrono::steady_clock::now();
 
     // ------------------------------------------------------------------
-    // STEP 1: Grab raw side-by-side frame
+    // STEP 1: Grab frame via SlOcCamera bridge
     // ------------------------------------------------------------------
-    // TODO(mlx-port): Grab a frame from the open-capture bridge.
-    //
-    //   cv::Mat sbs_frame;  // side-by-side BGRA or BGR
-    //   bool ok = open_capture::grab(mCaptureHandle, sbs_frame);
-    //   if (!ok) { rclcpp::sleep_for(1ms); continue; }
-    //
-    // For now, create dummy frames for skeleton testing:
-    cv::Mat sbs_frame;  // empty -- will be populated by bridge
+    if (!mSlCamera || !mSlCamera->isOpened()) {
+      std::this_thread::sleep_for(100ms);
+      continue;
+    }
+
+    sl_oc_bridge::ERROR_CODE grab_err = mSlCamera->grab();
+    if (grab_err != sl_oc_bridge::ERROR_CODE::SUCCESS) {
+      // No new frame or corrupted -- retry next iteration
+      std::this_thread::sleep_for(1ms);
+      continue;
+    }
 
     // ------------------------------------------------------------------
-    // STEP 2: Split stereo
+    // STEP 2: Retrieve left and right BGRA images from the bridge
     // ------------------------------------------------------------------
-    // TODO(mlx-port): Split the side-by-side frame into left and right.
-    //
-    //   int half_w = sbs_frame.cols / 2;
-    //   mMatLeftRaw  = sbs_frame(cv::Rect(0,      0, half_w, sbs_frame.rows)).clone();
-    //   mMatRightRaw = sbs_frame(cv::Rect(half_w, 0, half_w, sbs_frame.rows)).clone();
+    sl_oc_bridge::Mat bridge_left, bridge_right;
+
+    // view: 0=LEFT, 1=RIGHT (bridge handles YUYV->BGRA internally)
+    sl_oc_bridge::ERROR_CODE err_l = mSlCamera->retrieveImage(bridge_left, 0);
+    sl_oc_bridge::ERROR_CODE err_r = mSlCamera->retrieveImage(bridge_right, 1);
+
+    if (err_l != sl_oc_bridge::ERROR_CODE::SUCCESS ||
+        err_r != sl_oc_bridge::ERROR_CODE::SUCCESS) {
+      std::this_thread::sleep_for(1ms);
+      continue;
+    }
+
+    // Wrap bridge Mat data as cv::Mat (BGRA, 4 channels, 8-bit)
+    // The bridge Mat owns the data; we clone into our cv::Mat members.
+    mMatLeftRaw = cv::Mat(
+      static_cast<int>(bridge_left.getHeight()),
+      static_cast<int>(bridge_left.getWidth()),
+      CV_8UC4,
+      bridge_left.getPtr<uint8_t>(),
+      bridge_left.getStepBytes()).clone();
+
+    mMatRightRaw = cv::Mat(
+      static_cast<int>(bridge_right.getHeight()),
+      static_cast<int>(bridge_right.getWidth()),
+      CV_8UC4,
+      bridge_right.getPtr<uint8_t>(),
+      bridge_right.getStepBytes()).clone();
 
     // ------------------------------------------------------------------
-    // STEP 3: Rectify
+    // STEP 3: Rectify using calibration maps (if available)
     // ------------------------------------------------------------------
-    // TODO(mlx-port): Apply rectification maps from loadCalibration().
-    //
-    //   if (!mCalib.left_map1.empty()) {
-    //     cv::remap(mMatLeftRaw,  mMatLeft,  mCalib.left_map1,  mCalib.left_map2,  cv::INTER_LINEAR);
-    //     cv::remap(mMatRightRaw, mMatRight, mCalib.right_map1, mCalib.right_map2, cv::INTER_LINEAR);
-    //   } else {
-    //     mMatLeft  = mMatLeftRaw;
-    //     mMatRight = mMatRightRaw;
-    //   }
+    if (!mCalib.left_map1.empty()) {
+      cv::remap(mMatLeftRaw,  mMatLeft,  mCalib.left_map1,  mCalib.left_map2,  cv::INTER_LINEAR);
+      cv::remap(mMatRightRaw, mMatRight, mCalib.right_map1, mCalib.right_map2, cv::INTER_LINEAR);
+    } else {
+      mMatLeft  = mMatLeftRaw;
+      mMatRight = mMatRightRaw;
+    }
 
     // ------------------------------------------------------------------
     // STEP 4: MLX depth inference
@@ -705,6 +1025,19 @@ void ZedCameraMlx::threadFunc_grab()
     }
 
     // ------------------------------------------------------------------
+    // STEP 6: Publish TF frames
+    // ------------------------------------------------------------------
+#ifdef ZED_ROS2_AVAILABLE
+    // Publish static TFs once (camera_link -> optical frames, imu_link)
+    if (!mStaticTfPublished) {
+      publishStaticTFs();
+      mStaticTfPublished = true;
+    }
+    // Publish dynamic TFs each frame (identity: map->odom, odom->base_link)
+    publishTFs();
+#endif
+
+    // ------------------------------------------------------------------
     // Frame rate limiting
     // ------------------------------------------------------------------
     auto grab_end = std::chrono::steady_clock::now();
@@ -741,13 +1074,55 @@ void ZedCameraMlx::threadFunc_videoDepthElab()
     }
 
     // ---- Publish images ----
-    // See zed_camera_mlx_video_depth.cpp for the actual publishing logic.
-    // TODO(mlx-port): Call publishing functions:
-    //
-    //   publishLeftAndRgbImages();
-    //   publishRightImages();
-    //   publishDepthImage();
-    //   publishCameraInfos();
+    // Publish left/RGB image (left is used as RGB for the ZED)
+#ifdef ZED_ROS2_AVAILABLE
+    if (mPublishImgRgb && !mMatLeft.empty()) {
+      publishImageWithInfo(mMatLeft, "bgra8", mPubRgb, mLeftCamOptFrameId);
+      if (mPubRgbCamInfo && mLeftCamInfoMsg) {
+        mLeftCamInfoMsg->header.stamp = mFrameTimestamp;
+        mPubRgbCamInfo->publish(*mLeftCamInfoMsg);
+      }
+    }
+
+    if (mPublishImgRgb && mPublishImgRaw && !mMatLeftRaw.empty()) {
+      publishImageWithInfo(mMatLeftRaw, "bgra8", mPubRawRgb, mLeftCamOptFrameId);
+    }
+
+    // Publish left/right stereo pair
+    if (mPublishImgLeftRight && !mMatLeft.empty()) {
+      publishImageWithInfo(mMatLeft, "bgra8", mPubLeft, mLeftCamOptFrameId);
+      if (mPubLeftCamInfo && mLeftCamInfoMsg) {
+        mLeftCamInfoMsg->header.stamp = mFrameTimestamp;
+        mPubLeftCamInfo->publish(*mLeftCamInfoMsg);
+      }
+    }
+
+    if (mPublishImgLeftRight && !mMatRight.empty()) {
+      publishImageWithInfo(mMatRight, "bgra8", mPubRight, mRightCamOptFrameId);
+      if (mPubRightCamInfo && mRightCamInfoMsg) {
+        mRightCamInfoMsg->header.stamp = mFrameTimestamp;
+        mPubRightCamInfo->publish(*mRightCamInfoMsg);
+      }
+    }
+
+    if (mPublishImgLeftRight && mPublishImgRaw) {
+      if (!mMatLeftRaw.empty()) {
+        publishImageWithInfo(mMatLeftRaw, "bgra8", mPubRawLeft, mLeftCamOptFrameId);
+      }
+      if (!mMatRightRaw.empty()) {
+        publishImageWithInfo(mMatRightRaw, "bgra8", mPubRawRight, mRightCamOptFrameId);
+      }
+    }
+
+    // Publish depth image
+    if (mDepthEnabled && mPublishDepthMap && !mMatDepth.empty()) {
+      publishDepthMapWithInfo(mMatDepth);
+      if (mPubDepthCamInfo && mLeftCamInfoMsg) {
+        mLeftCamInfoMsg->header.stamp = mFrameTimestamp;
+        mPubDepthCamInfo->publish(*mLeftCamInfoMsg);
+      }
+    }
+#endif
   }
 }
 
@@ -770,8 +1145,10 @@ void ZedCameraMlx::threadFunc_pointcloudElab()
       mPcDataReady = false;
     }
 
-    // TODO(mlx-port): Build and publish point cloud.
-    //   publishPointCloud(mMatDepth, mMatLeft);
+    // Build and publish point cloud from depth + left RGB
+    if (!mMatDepth.empty() && !mMatLeft.empty()) {
+      publishPointCloud(mMatDepth, mMatLeft);
+    }
   }
 }
 
@@ -786,22 +1163,90 @@ void ZedCameraMlx::threadFunc_sensorData()
   //   - open-capture's sensor polling, or
   //   - direct hidapi access to the ZED IMU USB endpoint.
 
+  // Target rates: IMU at mSensPubRate (default 200Hz),
+  // magnetometer/temperature/barometer at 10Hz
+  constexpr double kSlowSensorRate = 10.0;
+  const auto slow_period_ns = static_cast<uint64_t>(1e9 / kSlowSensorRate);
+  uint64_t last_mag_publish_ns = 0;
+  uint64_t last_temp_publish_ns = 0;
+  uint64_t last_baro_publish_ns = 0;
+
   while (!mThreadStop) {
 #ifdef ZED_ROS2_AVAILABLE
     if (!rclcpp::ok()) { break; }
 #endif
 
-    // TODO(mlx-port): Poll IMU data from the open-capture bridge.
-    //
-    //   ImuSample sample;
-    //   bool ok = open_capture::getImuData(mCaptureHandle, sample);
-    //   if (ok) {
-    //     publishImuData(sample);
-    //   }
+    auto loop_start = std::chrono::steady_clock::now();
+
+    // Poll all sensor data from the bridge
+    if (mSlCamera && mSlCamera->isOpened()) {
+      auto err = mSlCamera->getSensorsData(mSensorsData);
+      if (err == sl_oc_bridge::ERROR_CODE::SUCCESS) {
+        auto now_ns = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+
+        // ---- IMU: publish at full rate when new data arrives ----
+        if (mSensorsData.imu.is_available &&
+            mSensorsData.imu.timestamp.getNanoseconds() != mLastImuTs_ns)
+        {
+          mLastImuTs_ns = mSensorsData.imu.timestamp.getNanoseconds();
+
+          ImuSample sample;
+          sample.timestamp_ns = static_cast<double>(mLastImuTs_ns);
+          sample.ax = mSensorsData.imu.linear_acceleration.x;
+          sample.ay = mSensorsData.imu.linear_acceleration.y;
+          sample.az = mSensorsData.imu.linear_acceleration.z;
+          // Convert angular velocity from deg/s to rad/s
+          constexpr double kDegToRad = 3.14159265358979323846 / 180.0;
+          sample.gx = mSensorsData.imu.angular_velocity.x * kDegToRad;
+          sample.gy = mSensorsData.imu.angular_velocity.y * kDegToRad;
+          sample.gz = mSensorsData.imu.angular_velocity.z * kDegToRad;
+          sample.temperature_c = mSensorsData.imu.temperature;
+
+          publishImuData(sample);
+        }
+
+        // ---- Magnetometer: publish at slow rate ----
+        if (mSensorsData.magnetometer.is_available &&
+            mSensorsData.magnetometer.timestamp.getNanoseconds() != mLastMagTs_ns &&
+            (now_ns - last_mag_publish_ns) >= slow_period_ns)
+        {
+          mLastMagTs_ns = mSensorsData.magnetometer.timestamp.getNanoseconds();
+          last_mag_publish_ns = now_ns;
+          publishMagnetometerData(mSensorsData.magnetometer);
+        }
+
+        // ---- Temperature (camera CMOS sensors): publish at slow rate ----
+        if (mSensorsData.temperature.is_available &&
+            mSensorsData.temperature.timestamp.getNanoseconds() != mLastTempTs_ns &&
+            (now_ns - last_temp_publish_ns) >= slow_period_ns)
+        {
+          mLastTempTs_ns = mSensorsData.temperature.timestamp.getNanoseconds();
+          last_temp_publish_ns = now_ns;
+          publishTemperatureData(mSensorsData.temperature);
+        }
+
+        // ---- Barometer: publish at slow rate ----
+        if (mSensorsData.barometer.is_available &&
+            mSensorsData.barometer.timestamp.getNanoseconds() != mLastBaroTs_ns &&
+            (now_ns - last_baro_publish_ns) >= slow_period_ns)
+        {
+          mLastBaroTs_ns = mSensorsData.barometer.timestamp.getNanoseconds();
+          last_baro_publish_ns = now_ns;
+          publishBarometerData(mSensorsData.barometer);
+        }
+      }
+    }
 
     // Rate-limit to mSensPubRate
-    auto sleep_us = static_cast<int>(1000000.0 / std::max(mSensPubRate, 1.0));
-    std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
+    auto loop_end = std::chrono::steady_clock::now();
+    auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+      loop_end - loop_start).count();
+    int64_t target_us = static_cast<int64_t>(1000000.0 / std::max(mSensPubRate, 1.0));
+    if (elapsed_us < target_us) {
+      std::this_thread::sleep_for(std::chrono::microseconds(target_us - elapsed_us));
+    }
   }
 }
 

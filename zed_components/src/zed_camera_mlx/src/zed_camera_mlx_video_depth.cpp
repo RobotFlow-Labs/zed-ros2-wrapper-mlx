@@ -34,6 +34,8 @@
 #ifdef ZED_ROS2_AVAILABLE
 #include <sensor_msgs/image_encodings.hpp>
 #include <sensor_msgs/msg/point_field.hpp>
+#include <sensor_msgs/msg/magnetic_field.hpp>
+#include <sensor_msgs/msg/fluid_pressure.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <image_transport/camera_common.hpp>
 #endif
@@ -132,8 +134,8 @@ void ZedCameraMlx::publishDepthMapWithInfo(const cv::Mat & depth)
 
   mPubDepth.publish(std::move(depthMsg));
 
-  // TODO(mlx-port): Also publish depth CameraInfo alongside the depth image.
-  //   publishCameraInfo(mPubDepthCamInfo, mLeftCamInfoMsg, mFrameTimestamp);
+  // Depth CameraInfo is published from threadFunc_videoDepthElab() alongside
+  // the depth image publish call, using mPubDepthCamInfo.
 
 #else
   (void)depth;
@@ -160,38 +162,39 @@ void ZedCameraMlx::publishPointCloud(
   // TODO(mlx-port): Check subscriber count.
   //   if (count_subscribers(mPubCloud->get_topic_name()) == 0) return;
 
-  // ---- Build PointCloud2 message ----
+  // ---- Build PointCloud2 message with stride-based decimation ----
+  const int stride = std::max(mPcStride, 1);
+  const int pc_rows = (depth.rows + stride - 1) / stride;
+  const int pc_cols = (depth.cols + stride - 1) / stride;
+
   auto pcMsg = std::make_unique<sensor_msgs::msg::PointCloud2>();
 
   pcMsg->header.stamp = mFrameTimestamp;
   pcMsg->header.frame_id = mPointCloudFrameId;
 
-  pcMsg->height = static_cast<uint32_t>(depth.rows);
-  pcMsg->width = static_cast<uint32_t>(depth.cols);
+  pcMsg->height = static_cast<uint32_t>(pc_rows);
+  pcMsg->width = static_cast<uint32_t>(pc_cols);
   pcMsg->is_dense = false;
   pcMsg->is_bigendian = false;
 
   // Define fields: x, y, z, rgb
   sensor_msgs::PointCloud2Modifier modifier(*pcMsg);
   modifier.setPointCloud2FieldsByString(2, "xyz", "rgb");
-  modifier.resize(static_cast<size_t>(depth.rows) * depth.cols);
+  modifier.resize(static_cast<size_t>(pc_rows) * pc_cols);
 
   sensor_msgs::PointCloud2Iterator<float> iter_x(*pcMsg, "x");
   sensor_msgs::PointCloud2Iterator<float> iter_y(*pcMsg, "y");
   sensor_msgs::PointCloud2Iterator<float> iter_z(*pcMsg, "z");
   sensor_msgs::PointCloud2Iterator<uint8_t> iter_rgb(*pcMsg, "rgb");
 
-  // TODO(mlx-port): Retrieve camera intrinsics from mCalib for reprojection.
-  //   const double fx = mCalib.left_fx;
-  //   const double fy = mCalib.left_fy;
-  //   const double cx = mCalib.left_cx;
-  //   const double cy = mCalib.left_cy;
-  //
-  // For now, use placeholder intrinsics:
-  const double fx = 700.0;
-  const double fy = 700.0;
-  const double cx = static_cast<double>(depth.cols) / 2.0;
-  const double cy = static_cast<double>(depth.rows) / 2.0;
+  // Use calibration intrinsics for reprojection; fall back to defaults
+  // if calibration was not loaded (fx == 0).
+  const double fx = (mCalib.left_fx > 0.0) ? mCalib.left_fx : 700.0;
+  const double fy = (mCalib.left_fy > 0.0) ? mCalib.left_fy : 700.0;
+  const double cx = (mCalib.left_cx > 0.0) ? mCalib.left_cx
+                    : static_cast<double>(depth.cols) / 2.0;
+  const double cy = (mCalib.left_cy > 0.0) ? mCalib.left_cy
+                    : static_cast<double>(depth.rows) / 2.0;
 
   // Ensure RGB is BGR8 for iteration
   cv::Mat rgb_bgr;
@@ -201,11 +204,11 @@ void ZedCameraMlx::publishPointCloud(
     rgb_bgr = rgb;
   }
 
-  for (int v = 0; v < depth.rows; ++v) {
+  for (int v = 0; v < depth.rows; v += stride) {
     const float * depth_row = depth.ptr<float>(v);
     const uint8_t * rgb_row = rgb_bgr.ptr<uint8_t>(v);
 
-    for (int u = 0; u < depth.cols; ++u,
+    for (int u = 0; u < depth.cols; u += stride,
       ++iter_x, ++iter_y, ++iter_z, ++iter_rgb)
     {
       float d = depth_row[u];
@@ -215,13 +218,13 @@ void ZedCameraMlx::publishPointCloud(
         *iter_y = std::numeric_limits<float>::quiet_NaN();
         *iter_z = std::numeric_limits<float>::quiet_NaN();
       } else {
-        // Reproject to 3D (camera frame: X-right, Y-down, Z-forward)
+        // Reproject to 3D (optical frame: X-right, Y-down, Z-forward)
         *iter_x = static_cast<float>((u - cx) * d / fx);
         *iter_y = static_cast<float>((v - cy) * d / fy);
         *iter_z = d;
       }
 
-      // Pack BGR into a float (same as PCL convention)
+      // Pack BGR into RGB bytes (same as PCL XYZRGB convention)
       int idx = u * 3;
       iter_rgb[0] = rgb_row[idx + 2];  // R
       iter_rgb[1] = rgb_row[idx + 1];  // G
@@ -250,7 +253,11 @@ void ZedCameraMlx::publishImuData(const ImuSample & sample)
 
   auto imuMsg = std::make_unique<sensor_msgs::msg::Imu>();
 
-  imuMsg->header.stamp = mFrameTimestamp;  // TODO(mlx-port): Use sample.timestamp_ns for proper IMU timestamp
+  // Convert sensor timestamp (nanoseconds) to ROS time
+  uint64_t ts_ns = static_cast<uint64_t>(sample.timestamp_ns);
+  imuMsg->header.stamp = rclcpp::Time(
+    static_cast<int32_t>(ts_ns / 1000000000ULL),
+    static_cast<uint32_t>(ts_ns % 1000000000ULL));
   imuMsg->header.frame_id = mImuFrameId;
 
   // Linear acceleration (m/s^2)
@@ -279,18 +286,126 @@ void ZedCameraMlx::publishImuData(const ImuSample & sample)
 
   mPubImu->publish(std::move(imuMsg));
 
-  // ---- Temperature ----
+  // ---- IMU Temperature ----
   if (mPubImuTemp) {
     auto tempMsg = std::make_unique<sensor_msgs::msg::Temperature>();
-    tempMsg->header.stamp = mFrameTimestamp;
+    tempMsg->header.stamp = rclcpp::Time(
+      static_cast<int32_t>(ts_ns / 1000000000ULL),
+      static_cast<uint32_t>(ts_ns % 1000000000ULL));
     tempMsg->header.frame_id = mImuFrameId;
     tempMsg->temperature = sample.temperature_c;
-    tempMsg->variance = 0.0;  // TODO(mlx-port): Set from sensor specs
+    tempMsg->variance = 0.0;
     mPubImuTemp->publish(std::move(tempMsg));
   }
 
 #else
   (void)sample;
+#endif
+}
+
+// ===========================================================================
+// publishMagnetometerData  --  publish magnetometer as sensor_msgs/MagneticField
+// ===========================================================================
+
+void ZedCameraMlx::publishMagnetometerData(
+  const sl_oc_bridge::MagnetometerData & mag_data)
+{
+#ifdef ZED_ROS2_AVAILABLE
+  if (!mPubMag) {
+    return;
+  }
+
+  auto magMsg = std::make_unique<sensor_msgs::msg::MagneticField>();
+
+  // Convert sensor timestamp (nanoseconds) to ROS time
+  uint64_t ts_ns = mag_data.timestamp.getNanoseconds();
+  magMsg->header.stamp = rclcpp::Time(
+    static_cast<int32_t>(ts_ns / 1000000000ULL),
+    static_cast<uint32_t>(ts_ns % 1000000000ULL));
+  magMsg->header.frame_id = mImuFrameId;
+
+  // Magnetic field in Tesla (bridge provides microtesla, convert: 1 uT = 1e-6 T)
+  magMsg->magnetic_field.x = mag_data.magnetic_field_calibrated.x * 1e-6;
+  magMsg->magnetic_field.y = mag_data.magnetic_field_calibrated.y * 1e-6;
+  magMsg->magnetic_field.z = mag_data.magnetic_field_calibrated.z * 1e-6;
+
+  // Covariance unknown
+  magMsg->magnetic_field_covariance[0] = 0.0;
+
+  mPubMag->publish(std::move(magMsg));
+
+#else
+  (void)mag_data;
+#endif
+}
+
+// ===========================================================================
+// publishTemperatureData  --  publish camera CMOS temperatures
+// ===========================================================================
+
+void ZedCameraMlx::publishTemperatureData(
+  const sl_oc_bridge::TemperatureData & temp_data)
+{
+#ifdef ZED_ROS2_AVAILABLE
+  uint64_t ts_ns = temp_data.timestamp.getNanoseconds();
+  auto stamp = rclcpp::Time(
+    static_cast<int32_t>(ts_ns / 1000000000ULL),
+    static_cast<uint32_t>(ts_ns % 1000000000ULL));
+
+  // Left CMOS temperature
+  if (mPubTempLeft) {
+    auto tempMsg = std::make_unique<sensor_msgs::msg::Temperature>();
+    tempMsg->header.stamp = stamp;
+    tempMsg->header.frame_id = mLeftCamFrameId;
+    tempMsg->temperature = temp_data.temperature_left;
+    tempMsg->variance = 0.0;
+    mPubTempLeft->publish(std::move(tempMsg));
+  }
+
+  // Right CMOS temperature
+  if (mPubTempRight) {
+    auto tempMsg = std::make_unique<sensor_msgs::msg::Temperature>();
+    tempMsg->header.stamp = stamp;
+    tempMsg->header.frame_id = mRightCamFrameId;
+    tempMsg->temperature = temp_data.temperature_right;
+    tempMsg->variance = 0.0;
+    mPubTempRight->publish(std::move(tempMsg));
+  }
+
+#else
+  (void)temp_data;
+#endif
+}
+
+// ===========================================================================
+// publishBarometerData  --  publish barometer as sensor_msgs/FluidPressure
+// ===========================================================================
+
+void ZedCameraMlx::publishBarometerData(
+  const sl_oc_bridge::BarometerData & baro_data)
+{
+#ifdef ZED_ROS2_AVAILABLE
+  if (!mPubBaro) {
+    return;
+  }
+
+  auto baroMsg = std::make_unique<sensor_msgs::msg::FluidPressure>();
+
+  // Convert sensor timestamp (nanoseconds) to ROS time
+  uint64_t ts_ns = baro_data.timestamp.getNanoseconds();
+  baroMsg->header.stamp = rclcpp::Time(
+    static_cast<int32_t>(ts_ns / 1000000000ULL),
+    static_cast<uint32_t>(ts_ns % 1000000000ULL));
+  baroMsg->header.frame_id = mImuFrameId;
+
+  // Pressure in Pascals (bridge provides hPa, convert: 1 hPa = 100 Pa)
+  baroMsg->fluid_pressure = baro_data.pressure * 100.0;
+  baroMsg->variance = 0.0;
+
+  mPubBaro->publish(std::move(baroMsg));
+
+#else
+  (void)baro_data;
 #endif
 }
 
