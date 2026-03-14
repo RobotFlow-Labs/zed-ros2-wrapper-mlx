@@ -1323,3 +1323,9 @@ void ZedCameraMlx::callback_enableDepth(
 #endif
 
 }  // namespace stereolabs
+
+// Register the component with ROS2 component infrastructure
+#ifdef ZED_ROS2_AVAILABLE
+#include <rclcpp_components/register_node_macro.hpp>
+RCLCPP_COMPONENTS_REGISTER_NODE(stereolabs::ZedCameraMlx)
+#endif

@@ -239,7 +239,7 @@ def launch_setup(context, *args, **kwargs):
     zed_wrapper_component = ComposableNode(
         package='zed_components',
         namespace=namespace_val,
-        plugin='stereolabs::ZedCamera',
+        plugin='stereolabs::ZedCameraMlx',
         name=node_name_val,
         parameters=node_parameters,
         extra_arguments=[{'use_intra_process_comms': enable_ipc}]
