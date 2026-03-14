@@ -313,6 +313,19 @@ set(ZED_CAMERA_ONE_SRC
 # Tell source code we are building without the proprietary ZED SDK
 add_definitions(-DZED_MLX_BUILD)
 
+# zed-open-capture module guards — required by videocapture.hpp and sensorcapture.hpp
+# to expose class definitions. Without these, everything is #ifdef'd out.
+add_definitions(-DVIDEO_MOD_AVAILABLE)
+add_definitions(-DSENSORS_MOD_AVAILABLE)
+
+# hidapi is required by sensorcapture.hpp
+find_path(HIDAPI_INCLUDE_DIR hidapi.h
+    PATHS /opt/homebrew/include/hidapi /usr/include/hidapi /usr/local/include/hidapi
+)
+if(HIDAPI_INCLUDE_DIR)
+    include_directories(${HIDAPI_INCLUDE_DIR})
+endif()
+
 if(ZED_MLX_SKIP_PROPRIETARY_FEATURES)
     add_definitions(-DZED_MLX_NO_OBJDET)
     add_definitions(-DZED_MLX_NO_BODYTRK)
@@ -330,6 +343,51 @@ if(ROS2_AVAILABLE)
     # create ament index resource
     set(node_plugins "")
 
+    if(ZED_MLX_SKIP_PROPRIETARY_FEATURES)
+        # MLX-CHANGE: Build our MLX camera component instead of the upstream
+        # ZedCamera and ZedCameraOne which require sl/Camera.hpp (proprietary SDK).
+        message(STATUS "Building ZedCameraMlx component (replaces upstream ZedCamera)")
+
+        set(ZED_CAMERA_MLX_INC
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/include/visibility_control.hpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/include/sl_oc_bridge.hpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/include/macos_unsupported.hpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/zed_camera_mlx/include/zed_camera_mlx_component.hpp
+        )
+        set(ZED_CAMERA_MLX_SRC
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/zed_camera_mlx/src/zed_camera_mlx_component.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/zed_camera_mlx/src/zed_camera_mlx_video_depth.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/tools/src/sl_oc_bridge.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/tools/src/sl_win_avg.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/tools/src/mlx_depth_bridge.cpp
+        )
+
+        add_library(zed_camera_component SHARED
+            ${ZED_CAMERA_MLX_INC}
+            ${ZED_CAMERA_MLX_SRC}
+        )
+        target_include_directories(zed_camera_component PUBLIC
+            ${ZED_MLX_INCLUDE_DIRS}
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/zed_camera_mlx/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/tools/include
+        )
+        target_compile_definitions(zed_camera_component
+            PRIVATE "COMPOSITION_BUILDING_DLL" "ZED_ROS2_AVAILABLE"
+        )
+        target_link_libraries(zed_camera_component
+            ${ZED_MLX_LIBS}
+        )
+        ament_target_dependencies(zed_camera_component
+            ${DEPENDENCIES}
+        )
+
+        rclcpp_components_register_nodes(zed_camera_component "stereolabs::ZedCameraMlx")
+        set(node_plugins "${node_plugins}stereolabs::ZedCameraMlx;$<TARGET_FILE:zed_camera_component>\n")
+
+    else()
+        # ---- Original upstream build (requires ZED SDK + CUDA) ----
+
     # ZED Camera Component
     add_library(zed_camera_component SHARED
         ${SL_TOOLS_INC}
@@ -338,7 +396,6 @@ if(ROS2_AVAILABLE)
         ${ZED_CAMERA_SRC}
     )
     target_include_directories(zed_camera_component PUBLIC
-        # MLX-CHANGE: replaced ${CUDA_INCLUDE_DIRS} and ${ZED_INCLUDE_DIRS}
         ${ZED_MLX_INCLUDE_DIRS}
         ${CMAKE_CURRENT_SOURCE_DIR}/src/include
         ${CMAKE_CURRENT_SOURCE_DIR}/src/zed_camera/include
@@ -348,7 +405,6 @@ if(ROS2_AVAILABLE)
         PRIVATE "COMPOSITION_BUILDING_DLL"
     )
     target_link_libraries(zed_camera_component
-        # MLX-CHANGE: replaced ${ZED_LIBS} (was ZED SDK + CUDA)
         ${ZED_MLX_LIBS}
     )
     ament_target_dependencies(zed_camera_component
@@ -366,7 +422,6 @@ if(ROS2_AVAILABLE)
         ${ZED_CAMERA_ONE_SRC}
     )
     target_include_directories(zed_camera_one_component PUBLIC
-        # MLX-CHANGE: replaced ${CUDA_INCLUDE_DIRS} and ${ZED_INCLUDE_DIRS}
         ${ZED_MLX_INCLUDE_DIRS}
         ${CMAKE_CURRENT_SOURCE_DIR}/src/include
         ${CMAKE_CURRENT_SOURCE_DIR}/src/zed_camera_one/include
@@ -386,14 +441,14 @@ if(ROS2_AVAILABLE)
     rclcpp_components_register_nodes(zed_camera_one_component "stereolabs::ZedCameraOne")
     set(node_plugins "${node_plugins}stereolabs::ZedCameraOne;$<TARGET_FILE:zed_camera_one_component>\n")
 
-    # Install components
+    # Install components (upstream path)
     install(TARGETS zed_camera_component zed_camera_one_component
         ARCHIVE DESTINATION lib
         LIBRARY DESTINATION lib
         RUNTIME DESTINATION lib/${PROJECT_NAME}
     )
 
-    # Install header files
+    # Install header files (upstream path)
     install(DIRECTORY
         ${CMAKE_CURRENT_SOURCE_DIR}/src/zed_camera/include/
         ${CMAKE_CURRENT_SOURCE_DIR}/src/zed_camera_one/include/
@@ -409,6 +464,27 @@ if(ROS2_AVAILABLE)
     )
     ament_export_dependencies(${DEPENDENCIES})
     ament_package()
+
+    endif() # ZED_MLX_SKIP_PROPRIETARY_FEATURES else block
+
+    # ---- Common install for MLX path (if we took the MLX branch above) ----
+    if(ZED_MLX_SKIP_PROPRIETARY_FEATURES)
+        install(TARGETS zed_camera_component
+            ARCHIVE DESTINATION lib
+            LIBRARY DESTINATION lib
+            RUNTIME DESTINATION lib/${PROJECT_NAME}
+        )
+        install(DIRECTORY
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/zed_camera_mlx/include/
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/tools/include/
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/include/
+            DESTINATION include/${PROJECT_NAME}/
+        )
+        ament_export_include_directories(include)
+        ament_export_libraries(zed_camera_component)
+        ament_export_dependencies(${DEPENDENCIES})
+        ament_package()
+    endif()
 
 else()
     # ---- Standalone build (no ROS2) ----
