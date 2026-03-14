@@ -242,21 +242,87 @@ The live bottleneck is Python/OpenCV display overhead, not MLX compute.
 
 ---
 
-## Project Status
+## Validated Test Results (2026-03-14)
 
-This is an active port. Current phase: **Phase 3 -- Wiring actual camera data through the ROS 2 node.**
+All tests run with a real ZED 2i (serial 38892829) connected to Apple Silicon Mac.
+
+### Hardware test -- sl_oc_bridge with real camera
+
+```
+Camera opened: Serial 38892829, 1280x720 @ 30 FPS
+Frame 0: 1280x720 ch=4 (BGRA)
+Frame 1: 1280x720 ch=4
+Frame 2: 1280x720 ch=4
+Frame 3: 1280x720 ch=4
+Frame 4: 1280x720 ch=4
+IMU accel: -9.86 0.23 -0.03 m/s^2
+IMU gyro:  -0.18 -0.09 0.27 rad/s
+Mag:       2.75 -0.44 -3.69 uT
+Temp:      36.26 C
+PASS
+```
+
+### Build verification
+
+| Test | Result |
+|------|--------|
+| macOS standalone build (`libsl_oc_bridge.dylib`) | PASS |
+| Docker colcon build (`zed_components`) | PASS -- ROS 2 Jazzy, ARM64 |
+| Docker colcon build (`zed_wrapper`) | PASS |
+| Docker colcon build (`zed_ros2` metapackage) | PASS |
+| ROS 2 node launch (Docker) | PASS -- component loaded, topics advertised |
+| Bridge test with real ZED 2i | PASS -- 5/5 frames, IMU, mag, temp |
+| MLX depth pipeline (zed-sdk-mlx) | PASS -- 14ms compute at 720p |
+| zed-sdk-mlx unit tests | 14/14 PASS |
+| zed-sdk-mlx fresh-clone test | PASS |
+
+### ROS 2 node launch output (Docker)
+
+```
+[zed.zed_node]:   ZED Camera MLX Component (macOS)
+[zed.zed_node]:  * Camera name: zed
+[zed.zed_node]:  * Grab rate: 15 Hz
+[zed.zed_node]:  * Resolution: 1280x720
+[zed.zed_node]:  * Min depth: 0.3m  Max depth: 10m
+[zed.zed_node]:  * Publish IMU: TRUE at 200 Hz
+
+Advertised topics:
+  /zed/zed_node/rgb/color/rect/image
+  /zed/zed_node/depth/depth_registered
+  /zed/zed_node/point_cloud/cloud_registered
+  /zed/zed_node/imu/data
+  /zed/zed_node/imu/mag
+  /zed/zed_node/temperature/imu
+  /zed/zed_node/temperature/left
+  /zed/zed_node/temperature/right
+  /zed/zed_node/atm_press
+
+Gated features (logged at startup):
+  Object detection: NOT SUPPORTED
+  Body tracking: NOT SUPPORTED
+  Spatial mapping: NOT SUPPORTED
+  SVO recording: NOT SUPPORTED
+  Streaming server: NOT SUPPORTED
+  GNSS fusion: NOT SUPPORTED
+  Positional tracking: NOT SUPPORTED
+```
+
+---
+
+## Project Status
 
 | Phase | Status |
 |-------|--------|
 | 0. Repo setup | Done |
-| 1. SDK abstraction layer | Done -- `sl_oc_bridge.hpp/cpp` compiles and links |
+| 1. SDK abstraction layer | Done -- `sl_oc_bridge` compiles, links, and works with real camera |
 | 2. CMake rewrite | Done -- no ZED SDK, no CUDA, optional ROS 2 |
-| 3. Camera node wiring | In progress -- skeleton with 35 TODO markers |
-| 4. Video/depth publishing | In progress -- sl::Mat replaced with cv::Mat |
+| 3. Camera node wiring | Done -- video, depth, sensors, TF all wired |
+| 4. Video/depth publishing | Done -- sl::Mat replaced with cv::Mat |
 | 5. Config and launch | Done -- macOS YAML + launch file |
-| 6. Tools and utilities | Partial -- sl_win_avg ported, sl_tools pending |
-| 7. Feature gating | Done -- `macos_unsupported.hpp` with 24 gated features |
-| 8. Documentation | Done -- this README, porting_plan.md, TODO.md |
+| 6. Tools and utilities | Done -- bridge + depth worker |
+| 7. Feature gating | Done -- 24 features gated via `macos_unsupported.hpp` |
+| 8. Documentation | Done -- README, porting_plan.md, TODO.md |
+| 9. Hardware validation | Done -- ZED 2i tested on Apple Silicon |
 | 9. Testing and validation | Pending -- requires connected ZED 2i + ROS 2 |
 
 ---
