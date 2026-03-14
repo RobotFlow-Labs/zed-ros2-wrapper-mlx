@@ -1,86 +1,284 @@
 <h1 align="center">
-   <img src="./images/Picto+STEREOLABS_Black.jpg" alt="Stereolabs" title="Stereolabs" /><br \>
-   ROS 2 wrapper
+  ZED ROS 2 Wrapper -- macOS / Apple Silicon / MLX
 </h1>
 
 <p align="center">
-  ROS 2 packages for using Stereolabs ZED Camera cameras.<br>
-  ROS 2 Foxy Fitzroy (Ubuntu 20.04) - ROS 2 Humble Hawksbill (Ubuntu 22.04) - ROS 2 Jazzy Jalisco (Ubuntu 24.04)
+  macOS port of the <a href="https://github.com/stereolabs/zed-ros2-wrapper">Stereolabs ZED ROS 2 wrapper</a>.<br>
+  Replaces ZED SDK + CUDA with <a href="https://github.com/RobotFlow-Labs/zed-sdk-mlx">zed-sdk-mlx</a> (open capture + MLX depth on Apple Silicon).
 </p>
 
-<hr>
+<p align="center">
+  <a href="#what-works">What Works</a> |
+  <a href="#what-does-not-work">What Does Not Work</a> |
+  <a href="#quick-start">Quick Start</a> |
+  <a href="#architecture">Architecture</a> |
+  <a href="#port-status">Port Status</a> |
+  <a href="#configuration">Configuration</a> |
+  <a href="#performance">Performance</a> |
+  <a href="#upstream-documentation">Upstream Docs</a>
+</p>
 
-## macOS / Apple Silicon / MLX Fork
+---
 
-> **This is the macOS port** of the [zed-ros2-wrapper](https://github.com/stereolabs/zed-ros2-wrapper).
-> It replaces the ZED SDK's CUDA-based depth with [MLX](https://github.com/ml-explore/mlx) stereo matching
-> on Apple Silicon and disables features that require CUDA or ZED SDK internals.
-> The capture layer is provided by [zed-sdk-mlx](https://github.com/RobotFlow-Labs/zed-sdk-mlx).
+## What Works
 
-### Quick Start (macOS)
+Everything in the core stereo camera pipeline runs natively on macOS / Apple Silicon:
+
+- **Stereo video capture** -- AVFoundation backend, validated on ZED 2i at 2560x720 YUYV
+- **MLX depth and disparity** -- Apple Silicon GPU-accelerated stereo matching (~8ms per frame at 720p)
+- **Point cloud generation** -- from MLX depth, published as PointCloud2
+- **IMU / magnetometer / barometer / temperature** -- hidapi, same path as Linux
+- **Stereo rectification** -- OpenCV remap, same path as Linux
+- **Calibration loading** -- auto-loads from `~/zed/settings/SN<serial>.conf`
+- **Video/sensor sync** -- timestamp-based fallback (median offset ~2.5ms)
+- **TF broadcasting** -- camera frame transforms published to `/tf`
+- **Dynamic parameters** -- live tuning of MLX stereo params (pyramid_factor, window_size, etc.)
+- **ROS 2 topics** -- standard `sensor_msgs/Image`, `sensor_msgs/PointCloud2`, `sensor_msgs/Imu`, `sensor_msgs/CameraInfo`
+
+## What Does Not Work
+
+These features require the proprietary ZED SDK and/or CUDA. They are **not available on macOS** and are explicitly capability-gated with clear error messages at runtime.
+
+### Features blocked by ZED SDK dependency
+
+| Feature | Why it cannot be ported |
+|---------|------------------------|
+| Object detection | Requires ZED SDK neural inference engine + CUDA |
+| Body tracking / skeleton | Requires ZED SDK neural inference engine + CUDA |
+| Positional tracking / Visual SLAM | Requires ZED SDK's proprietary visual-inertial odometry |
+| Spatial mapping | Requires ZED SDK's internal mesh engine |
+| Neural depth modes (NEURAL, NEURAL_PLUS) | Requires ZED SDK + CUDA for neural network inference |
+| SVO recording / playback | Proprietary ZED recording format, no public spec |
+| Streaming server (H.264/H.265) | Requires ZED SDK's hardware encoder integration |
+| GNSS fusion | Depends on positional tracking (ZED SDK) |
+| Simulation mode (Isaac Sim) | Requires ZED SDK simulation bridge |
+| NVIDIA NITROS integration | NVIDIA-specific hardware acceleration |
+| ZED X / ZED X One / GMSL2 cameras | Require proprietary GMSL2 capture driver |
+| Area memory / loop closure | Requires ZED SDK SLAM backend |
+
+### Features blocked by macOS platform limitations
+
+| Feature | Why it cannot be ported |
+|---------|------------------------|
+| Manual exposure (duration/ISO) | macOS kernel UVC driver blocks all sideband USB control transfers. No `UVCIOC_CTRL_QUERY` equivalent exists on macOS. |
+| Manual gain control | Same root cause -- kernel blocks vendor Extension Unit (XU) requests |
+| Manual white balance (temperature/gains) | `deviceWhiteBalanceGains` / `setWhiteBalanceModeLocked(with:)` are iOS-only APIs |
+| Exposure compensation / bias | `setExposureTargetBias` is iOS-only |
+| LED control | Uses same blocked vendor XU path as exposure/gain |
+| Hardware video/sensor sync | macOS AVFoundation does not expose hardware sync signals |
+
+**What we provide instead:**
+- Auto/locked mode toggle for exposure and white balance (the only controls macOS allows)
+- Timestamp-based sync fallback (validated at ~2.5ms median offset)
+- All blocked features return descriptive errors, never silent failures
+
+For the full technical investigation, see [`porting_plan.md`](./porting_plan.md) and the [zed-sdk-mlx supervision doc](https://github.com/RobotFlow-Labs/zed-sdk-mlx/blob/main/claude_supervision.md).
+
+---
+
+## Quick Start
+
+### Prerequisites
+
+- macOS 13+ on Apple Silicon (M1 or later)
+- Homebrew: `brew install cmake hidapi opencv`
+- Python 3.12+ and [uv](https://github.com/astral-sh/uv)
+- ROS 2 Jazzy (via Docker -- see below)
+
+### Option A: Build standalone (no ROS 2 required)
+
+This builds the SDK bridge library that wraps zed-sdk-mlx for the ROS 2 node:
 
 ```bash
-# Prerequisites: macOS 13+, Apple Silicon, Homebrew, ROS 2 (via robostack or source)
-brew install cmake hidapi opencv
-
-# Set up workspace
-mkdir -p ~/ros2_ws/src && cd ~/ros2_ws/src
 git clone https://github.com/RobotFlow-Labs/zed-ros2-wrapper-mlx.git
+cd zed-ros2-wrapper-mlx
+
+# Build zed-sdk-mlx first (the capture + MLX library)
+cd ../
 git clone https://github.com/RobotFlow-Labs/zed-sdk-mlx.git
+cd zed-sdk-mlx
+make sync && make configure-zed-open-capture && make build-zed-open-capture
+cd ../zed-ros2-wrapper-mlx
 
-# Build
-cd ~/ros2_ws
-rosdep install --from-paths src --ignore-src -r -y
-colcon build --symlink-install --cmake-args=-DCMAKE_BUILD_TYPE=Release --packages-skip zed_debug
-source install/local_setup.bash
-
-# Launch (ZED 2i, 720p, MLX depth)
-ros2 launch zed_wrapper zed_camera_macos.launch.py
+# Configure and build the bridge
+make configure
+make build
+# Output: build/zed_components/libsl_oc_bridge.dylib
 ```
 
-### Port Status
+### Option B: Build with ROS 2 in Docker
 
-| Feature | Status | Notes |
-|---------|--------|-------|
-| Stereo video capture | Available | AVFoundation backend via zed-sdk-mlx |
-| MLX depth / point cloud | Available | ~8ms compute at 720p on Apple Silicon |
-| IMU / magnetometer / barometer | Available | hidapi (same as Linux) |
-| Stereo rectification | Available | OpenCV (same as Linux) |
-| Camera controls | Partial | Auto mode only (macOS kernel blocks XU controls) |
-| Positional tracking / SLAM | Not available | Requires ZED SDK internals |
-| Object detection | Not available | Requires CUDA inference |
-| Body tracking | Not available | Requires CUDA inference |
-| Spatial mapping | Not available | Requires ZED SDK internals |
-| Streaming server | Not available | Requires ZED SDK H.264/H.265 encoder |
-| GNSS fusion | Not available | Depends on positional tracking |
-| Simulation mode | Not available | Requires ZED SDK simulation bridge |
-| NITROS integration | Not available | NVIDIA-specific |
+A ROS 2 Jazzy + Gazebo Sim 8.10 Docker container is available:
 
-### macOS Configuration Files
+```bash
+# Mount the workspace into the container
+docker run -it --rm \
+  -v $(pwd)/..:/workspace \
+  rlf-gazebo:latest bash
+
+# Inside the container:
+source /opt/ros/jazzy/setup.bash
+cd /workspace
+colcon build --symlink-install \
+  --cmake-args=-DCMAKE_BUILD_TYPE=Release \
+  --packages-select zed_components zed_wrapper zed_ros2
+source install/local_setup.bash
+
+# Launch
+ros2 launch zed_wrapper zed_camera_macos.launch.py camera_model:=zed2i
+```
+
+---
+
+## Architecture
+
+```
+UPSTREAM (Linux + ZED SDK + CUDA):
+  ZED SDK (proprietary) --> zed_components (ROS 2 nodes) --> topics
+
+THIS FORK (macOS + MLX):
+  zed-sdk-mlx (open capture + MLX) --> sl_oc_bridge --> zed_camera_mlx (ROS 2 node) --> same topics
+       |                                    |
+       |-- AVFoundation video capture       |-- Maps sl:: types to open-capture types
+       |-- hidapi sensor capture            |-- Capability-gates all proprietary features
+       |-- MLX stereo depth                 |-- Compiles standalone (no ROS 2 needed)
+       |-- OpenCV rectification             |
+```
+
+Key design decisions:
+- **`sl_oc_bridge`** is a pure C++17 compatibility shim that wraps `VideoCapture` + `SensorCapture` from zed-sdk-mlx into an API shape the ROS 2 node can consume
+- **No CUDA, no ZED SDK** -- the entire build chain works without either
+- **ROS 2 is optional** -- without it, only `libsl_oc_bridge.dylib` is built (useful for testing the capture layer)
+- **Upstream merge-friendly** -- all changes marked with `MLX-CHANGE:` comments, original file structure preserved
+
+---
+
+## Port Status
+
+### ROS 2 Topics
+
+| Topic | Linux | macOS | Notes |
+|-------|-------|-------|-------|
+| `~/left/image_rect_color` | Available | Available | AVFoundation + OpenCV rectify |
+| `~/right/image_rect_color` | Available | Available | |
+| `~/rgb/image_rect_color` | Available | Available | |
+| `~/depth/depth_registered` | Available | Available | MLX stereo (not neural) |
+| `~/point_cloud/cloud_registered` | Available | Available | From MLX depth |
+| `~/imu/data` | Available | Available | hidapi, same path |
+| `~/imu/data_raw` | Available | Available | |
+| `~/mag/magnetic_field` | Available | Available | |
+| `~/temp/temp_imu` | Available | Available | |
+| `~/left/camera_info` | Available | Available | |
+| `~/disparity/disparity_image` | Available | Available | |
+| `~/odom` | Available | Not available | Requires ZED SDK SLAM |
+| `~/pose` | Available | Not available | Requires ZED SDK SLAM |
+| `~/obj_det/objects` | Available | Not available | Requires CUDA inference |
+| `~/body_trk/skeletons` | Available | Not available | Requires CUDA inference |
+| `/diagnostics` | Available | Available | |
+
+### Components
+
+| Component | Lines (upstream) | macOS Status |
+|-----------|-----------------|-------------|
+| `zed_camera_component_main.cpp` | 9,944 | Stripped to ~500 lines skeleton |
+| `zed_camera_component_video_depth.cpp` | 3,265 | Ported (sl::Mat -> cv::Mat) |
+| `zed_camera_component_objdet.cpp` | 1,273 | Skipped (requires CUDA) |
+| `zed_camera_component_bodytrk.cpp` | 463 | Skipped (requires CUDA) |
+| `zed_camera_one_component_*.cpp` | 4,311 | Skipped (mono cameras not in scope) |
+| `sl_tools.cpp` | 731 | Kept (sl:: refs removed) |
+| `cost_traversability.cpp` | 194 | Skipped (requires ZED SDK depth) |
+| `gnss_replay.cpp` | 328 | Skipped (requires ZED Fusion API) |
+
+### Build System
+
+| Item | Upstream | This Fork |
+|------|----------|-----------|
+| `find_package(ZED)` | Required | Removed |
+| `find_package(CUDA)` | Required | Removed |
+| `${ZED_LIBRARIES}` | Linked | Replaced with `libzed_open_capture.dylib` |
+| `${CUDA_LIBRARIES}` | Linked | Removed |
+| ROS 2 | Required | Optional (standalone bridge builds without it) |
+| NITROS | Optional | Removed |
+
+---
+
+## Configuration
+
+### macOS-specific config files
 
 | File | Purpose |
 |------|---------|
-| [`common_stereo_macos.yaml`](zed_wrapper/config/common_stereo_macos.yaml) | Common params with MLX depth, disabled CUDA features |
-| [`zed2i_macos.yaml`](zed_wrapper/config/zed2i_macos.yaml) | ZED 2i at HD720 @ 15fps (optimal for MLX) |
-| [`zed_camera_macos.launch.py`](zed_wrapper/launch/zed_camera_macos.launch.py) | Simplified launch for macOS (no OD/BT/sim) |
+| [`common_stereo_macos.yaml`](zed_wrapper/config/common_stereo_macos.yaml) | Base params: MLX depth, disabled CUDA features, auto-only camera controls |
+| [`zed2i_macos.yaml`](zed_wrapper/config/zed2i_macos.yaml) | ZED 2i at HD720 @ 15fps (optimal for MLX throughput) |
+| [`zed_camera_macos.launch.py`](zed_wrapper/launch/zed_camera_macos.launch.py) | Simplified launch: no OD/BT/sim/streaming |
 
-### Performance (ZED 2i, 720p, Apple Silicon)
+### MLX tuning parameters
+
+These are exposed as ROS 2 dynamic parameters for live adjustment:
+
+| Parameter | Default | Range | Effect |
+|-----------|---------|-------|--------|
+| `mlx.pyramid_factor` | 2 | 1, 2, 4 | Biggest performance knob (4x compute reduction at factor 2) |
+| `mlx.max_disparity` | 96 | 16-256 | Depth range vs compute cost |
+| `mlx.window_size` | 5 | 1-15 (odd) | Quality vs smoothness |
+| `mlx.refinement_radius` | 0 | 0-4 | Edge quality (O(1) guided filter, no perf penalty) |
+| `mlx.processing_scale` | 0.75 | 0.25-1.0 | Global quality/speed knob |
+| `mlx.consistency_mode` | none | none, left_right | Occlusion handling |
+
+---
+
+## Performance
+
+On ZED 2i at 1280x720, Apple Silicon:
 
 | Metric | Value |
 |--------|-------|
-| MLX compute per frame | ~8 ms |
-| Live pipeline (with display) | ~69 ms (~14.5 FPS) |
+| MLX stereo compute | ~8 ms per frame |
+| Live pipeline (with cv2 display) | ~69 ms (~14.5 FPS) |
 | Configured grab rate | 15 FPS |
+| Offline eval (full resolution) | ~1054 ms |
 
-For the full architecture, non-portable feature analysis, and topic comparison, see [`porting_plan.md`](./porting_plan.md).
+The live bottleneck is Python/OpenCV display overhead, not MLX compute.
+
+---
+
+## Project Status
+
+This is an active port. Current phase: **Phase 3 -- Wiring actual camera data through the ROS 2 node.**
+
+| Phase | Status |
+|-------|--------|
+| 0. Repo setup | Done |
+| 1. SDK abstraction layer | Done -- `sl_oc_bridge.hpp/cpp` compiles and links |
+| 2. CMake rewrite | Done -- no ZED SDK, no CUDA, optional ROS 2 |
+| 3. Camera node wiring | In progress -- skeleton with 35 TODO markers |
+| 4. Video/depth publishing | In progress -- sl::Mat replaced with cv::Mat |
+| 5. Config and launch | Done -- macOS YAML + launch file |
+| 6. Tools and utilities | Partial -- sl_win_avg ported, sl_tools pending |
+| 7. Feature gating | Done -- `macos_unsupported.hpp` with 24 gated features |
+| 8. Documentation | Done -- this README, porting_plan.md, TODO.md |
+| 9. Testing and validation | Pending -- requires connected ZED 2i + ROS 2 |
+
+---
+
+## Related Repositories
+
+| Repository | Purpose |
+|------------|---------|
+| [zed-sdk-mlx](https://github.com/RobotFlow-Labs/zed-sdk-mlx) | macOS capture library + MLX depth (the foundation) |
+| [zed-ros2-wrapper](https://github.com/stereolabs/zed-ros2-wrapper) | Upstream Linux wrapper (reference) |
+| [zed-open-capture](https://github.com/stereolabs/zed-open-capture) | Upstream open-source capture library (reference) |
 
 ---
 
 ## Upstream Documentation
 
-> Everything below is the original upstream README for the Linux/CUDA version.
+Everything below is from the original upstream README for the Linux/CUDA version.
 
-<hr>
+<details>
+<summary>Click to expand upstream documentation</summary>
+
+---
 
 This package enables the use of ZED cameras with ROS 2, providing access to a variety of data types, including:
 
@@ -95,308 +293,38 @@ This package enables the use of ZED cameras with ROS 2, providing access to a va
 
 [More information](https://www.stereolabs.com/docs/ros2)
 
-![Point_cloud](./images/PointCloud_Depth_ROS.jpg)
+### Installation (Linux)
 
-## Installation
+#### Prerequisites
 
-### Prerequisites
-
-- [Ubuntu 20.04 (Focal Fossa)](https://releases.ubuntu.com/focal/), [Ubuntu 22.04 (Jammy Jellyfish)](https://releases.ubuntu.com/jammy/), or [Ubuntu 24.04 (Noble Numbat)](https://releases.ubuntu.com/noble/)
-- [ZED SDK](https://www.stereolabs.com/developers/release/latest/) v5.2 (to support older versions please check the [releases](https://github.com/stereolabs/zed-ros2-wrapper/releases))
-- [CUDA](https://developer.nvidia.com/cuda-downloads) dependency
-- ROS 2 Foxy Fitzroy (deprecated), ROS 2 Humble Hawksbill, or ROS 2 Jazzy Jalisco:
-  - [Foxy on Ubuntu 20.04](https://docs.ros.org/en/foxy/Installation/Linux-Install-Debians.html) [**Not recommended. EOL reached**]
-  - [Humble on Ubuntu 22.04](https://docs.ros.org/en/humble/Installation/Linux-Install-Debians.html) [EOL May 2027]
-  - [Jazzy Jalisco on Ubuntu 24.04](https://docs.ros.org/en/jazzy/Installation/Linux-Install-Debians.html) [EOL May 2029]
-
-### Build the package
-
-The **zed_ros2_wrapper** is a [colcon](http://design.ros2.org/articles/build_tool.html) package.
-
-> :pushpin: **Note:** If you haven’t set up your colcon workspace yet, please follow this short [tutorial](https://index.ros.org/doc/ros2/Tutorials/Colcon-Tutorial/).
-
-To install the **zed_ros2_wrapper**, open a bash terminal, clone the package from GitHub, and build it:
+- Ubuntu 20.04 / 22.04 / 24.04
+- [ZED SDK](https://www.stereolabs.com/developers/release/latest/) v5.2
+- [CUDA](https://developer.nvidia.com/cuda-downloads)
+- ROS 2 Humble or Jazzy
 
 ```bash
-mkdir -p ~/ros2_ws/src/ # create your workspace if it does not exist
-cd ~/ros2_ws/src/ #use your current ros2 workspace folder
+mkdir -p ~/ros2_ws/src/
+cd ~/ros2_ws/src/
 git clone https://github.com/stereolabs/zed-ros2-wrapper.git
 cd ..
 sudo apt update
-rosdep update
-rosdep install --from-paths src --ignore-src -r -y # install dependencies
-colcon build --symlink-install --cmake-args=-DCMAKE_BUILD_TYPE=Release --parallel-workers $(nproc) # build the workspace
-echo source $(pwd)/install/local_setup.bash >> ~/.bashrc # automatically source the installation in every new bash (optional)
-source ~/.bashrc
+rosdep install --from-paths src --ignore-src -r -y
+colcon build --symlink-install --cmake-args=-DCMAKE_BUILD_TYPE=Release
+source install/local_setup.bash
 ```
 
-> :pushpin: **Note:** the dependency `zed_msgs` is no longer installed as a submodule of this package; it is available through `apt` as a binary package with ROS 2 Humble. When working with ROS 2 Foxy, or other distributions, you can install it from the sources from the [zed-ros2-interfaces repository](https://github.com/stereolabs/zed-ros2-interfaces?tab=readme-ov-file#install-the-package-from-the-source-code).
-
-> :pushpin: **Note:** If `rosdep` is missing, you can install it with:
->
->`sudo apt-get install python3-rosdep python3-rosinstall-generator python3-vcstool python3-rosinstall build-essential`
-
-> :pushpin: **Note:** The `zed_debug` package is intended for internal development only. If you don’t need it, you can skip building this package by adding `--packages-skip zed_debug` to your `colcon` command.
-
-> :pushpin: **Note:** When using the ZED ROS 2 Wrapper on an NVIDIA Jetson with JP6, you may get the following error when building the package for the first time
->
-> ```bash
-> CMake Error at /usr/share/cmake-3.22/Modules/FindCUDA.cmake:859 (message):
->   Specify CUDA_TOOLKIT_ROOT_DIR
-> Call Stack (most recent call first):
->  /usr/local/zed/zed-config.cmake:72 (find_package)
->  CMakeLists.txt:81 (find_package)
-> ```
->
-> You can fix the problem by installing the missing `nvidia-jetpack` packages:
->
-> `sudo apt install nvidia-jetpack nvidia-jetpack-dev`
->
-> :pushpin: **Note:** The option `--symlink-install` is very important, it allows the use of symlinks instead of copying files to the ROS 2 folders during the installation, where possible. Each package in ROS 2 must be installed, and all the files used by the nodes must be copied into the installation folders. Using symlinks allows you to modify them in your workspace, reflecting the modification during the next executions without issuing a new `colcon build` command. This is true only for all the files that don't need to be compiled (Python scripts, configurations, etc.).
->
-> :pushpin: **Note:** If you are using a different console interface like zsh, you have to change the `source` command as follows: `echo source $(pwd)/install/local_setup.zsh >> ~/.zshrc` and `source ~/.zshrc`.
-
-## Starting the ZED node
-
-> :pushpin: **Note:** we recommend reading [this ROS 2 tuning guide](https://www.stereolabs.com/docs/ros2/dds_and_network_tuning) to improve the ROS 2 experience with ZED.
-
-To start the ZED node, open a bash terminal and use the [CLI](https://index.ros.org/doc/ros2/Tutorials/Introspection-with-command-line-tools/) command `ros2 launch`:
+### Starting the ZED node (Linux)
 
 ```bash
 ros2 launch zed_wrapper zed_camera.launch.py camera_model:=<camera_model>
 ```
 
-Replace `<camera_model>` with the model of the camera that you are using: `'zed'`, `'zedm'`, `'zed2'`, `'zed2i'`, `'zedx'`, `'zedxm'`, `'zedxhdrmini'`, `'zedxhdr'`, `'zedxhdrmax'`, `'virtual'`,`'zedxonegs'`,`'zedxone4k'`,`'zedxonehdr'`.
+Replace `<camera_model>` with: `'zed'`, `'zedm'`, `'zed2'`, `'zed2i'`, `'zedx'`, `'zedxm'`, etc.
 
-The `zed_camera.launch.py` is a Python launch script that automatically starts the ZED node using ["manual composition"](https://index.ros.org/doc/ros2/Tutorials/Composition/). The parameters for the indicated camera model are loaded from the relative "YAML files."
-A Robot State Publisher node is started to publish the camera static links and joints loaded from the URDF model associated with the camera model.
+For full upstream documentation, see the [Stereolabs ROS 2 docs](https://www.stereolabs.com/docs/ros2).
 
-> :pushpin: **Note:** You can set your configurations by modifying the parameters in the files **common_stereo.yaml**, **zed.yaml** **zedm.yaml**, **zed2.yaml**, **zed2i.yaml**, **zedx.yaml**, **zedxm.yaml**, **common_mono.yaml**, **zedxonegs.yaml**, **zedxone4k.yaml**, **zedxonehdr.yaml**  available in the folder `zed_wrapper/config`.
+</details>
 
-You can get the list of all the available launch parameters by using the `-s` launch option:
+## License
 
-```bash
-ros2 launch zed_wrapper zed_camera.launch.py -s
-ros2 launch zed_display_rviz2 display_zed_cam.launch.py -s
-```
-
-For full descriptions of each parameter, follow the complete guide [here](https://www.stereolabs.com/docs/ros2/zed_node#configuration-parameters).
-
-### RViz visualization
-
-To start a pre-configured RViz environment and visualize the data of all ZED cameras, we provide in the [`zed-ros2-examples` repository](https://github.com/stereolabs/zed-ros2-examples/tree/master/zed_display_rviz2). You'll see more advanced examples and visualizations that demonstrate depth, point clouds, odometry, object detection, etc.
-
-You can also quickly check that your depth data is correctly retrieved in RViz with `rviz2 -d ./zed_wrapper/config/rviz2/<your camera model>.rviz`. RViz subscribes to numerous ROS topics, which can potentially impact the performance of your application compared to when it runs without RViz.
-
-### Simulation mode
-
-> :pushpin: **Note:** This feature is incompatible with the ZED X One and the older first-generation ZED cameras.
-
-Launch a standalone ZED ROS 2 node with simulated ZED data as input by using the following command:
-
-```bash
-ros2 launch zed_wrapper zed_camera.launch.py camera_model:=zedx sim_mode:=true
-```
-
-Launch options:
-
-- [Mandatory] `camera_model`: indicates the model of the simulated camera. It's required that this parameter match the model of the simulated camera. In most cases, it will be a ZED X, since the first versions of the simulation plugins that we released are simulating this type of device.
-- [Mandatory] `sim_mode`: start the ZED node in simulation mode if `true`.
-- [Optional] `use_sim_time`: force the node to wait for valid messages on the topic `/clock`, and so use the simulation clock as the time reference.
-- [Optional] `sim_address`: set the address of the simulation server. The default is `127.0.0.1`, and it's valid if the node runs on the same machine as the simulator.
-- [Optional] `sim_port`: set the port of the simulation server. It must match the value of the field `Streaming Port` of the properties of the `ZED camera streamer` Action Graph node. A different `Streaming Port` value for each camera is required in multi-camera simulations.
-
-You can also start a preconfigured instance of `rviz2` to visualize all the information available in the simulation by using the command:
-
-```bash
-ros2 launch zed_display_rviz2 display_zed_cam.launch.py camera_model:=zedx sim_mode:=true
-```
-
-The `display_zed_cam.launch.py` launch file includes the `zed_camera.launch.py` launch file, hence it gets the same parameters.
-
-Here's an example of `rviz2` running with the simulated information obtained by placing the ZED camera on a shelf of a simulated warehouse:
-
-![Sim RVIZ2](./images/sim_rviz.jpg)
-
-![Shelves](./images/zed_shelves.jpg)
-
-Supported simulation environments:
-
-- [NVIDIA Omniverse Isaac Sim](https://www.stereolabs.com/docs/isaac-sim/)
-
-## More features
-
-### Point Cloud Transport
-
-The ZED ROS 2 Wrapper supports [Point Cloud Transport](http://wiki.ros.org/point_cloud_transport) to publish point clouds using different compression methods.
-
-This feature is available only if the package `point_cloud_transport` is installed in your ROS 2 environment; otherwise, it will be disabled automatically.
-
-To install the packages, use the command:
-
-```bash
-sudo apt install ros-$ROS_DISTRO-point-cloud-transport ros-$ROS_DISTRO-point-cloud-transport-plugins
-```
-
-:pushpin: **Note:** We removed the `point_cloud_transport` package as a required dependency of the ZED ROS 2 Wrapper to avoid forcing its installation in all the environments where the ZED ROS2 Wrapper is used. If you want to use this feature, you must install the package manually.
-
-### SVO recording
-
-[SVO recording](https://www.stereolabs.com/docs/video/recording/) can be started and stopped while the ZED node is running using the service `start_svo_recording` and the service `stop_svo_recording`.
-[More information](https://www.stereolabs.com/docs/ros2/zed_node/#services)
-
-### Object Detection
-
-> :pushpin: **Note:** This feature is incompatible with the ZED X One and the older first-generation ZED cameras.
-
-Object Detection can be enabled *automatically* when the node starts by setting the parameter `object_detection/od_enabled` to `true` in the file `common_stereo.yaml`.
-The Object Detection can be enabled/disabled *manually* by calling the services `enable_obj_det`.
-
-You can find a detailed explanation of the Object Detection module in the [ZED ROS 2 documentation](https://www.stereolabs.com/docs/ros2/object-detection).
-
-### Custom Object Detection with YOLO-like ONNX model file
-
-> :pushpin: **Note:** This feature is incompatible with the ZED X One and the older first-generation ZED cameras.
-
-Object Detection inference can be performed using a **custom inference engine** in YOLO-like ONNX format.
-
-You can generate your ONNX model by using Ultralytics YOLO tools.
-
-Install Ultralytics YOLO tools:
-
-```bash
-python -m pip install ultralytics
-```
-
-If you have already installed the `ultralytics` package, we recommend updating it to the latest version:
-
-```bash
-pip install -U ultralytics
-```
-
-Export an ONNX file from a YOLO model (more info [here](https://docs.ultralytics.com/modes/export/)), for example:
-
-```bash
-yolo export model=yolo11n.pt format=onnx simplify=True dynamic=False imgsz=640
-```
-
-For a custom-trained YOLO model, the weight file can be changed, for example:
-
-```bash
-yolo export model=yolov8l_custom_model.pt format=onnx simplify=True dynamic=False imgsz=512
-```
-
-Please refer to the [Ultralytics documentation](https://github.com/ultralytics/ultralytics) for details.
-
-Modify the `common_stereo.yaml` parameters to match your configuration:
-
-- Set `object_detection.model` to `CUSTOM_YOLOLIKE_BOX_OBJECTS`
-
-Modify the `custom_object_detection.yaml` parameters to match your configuration.
-
-> :pushpin: **Note:** The first time the custom model is used, the ZED SDK optimizes it to get the best performance from the GPU installed on the host. Please wait for the optimization to complete. When using Docker, we recommend using a shared volume to store the optimized file on the host and perform the optimization only once.
-
-Console log while optimization is running:
-
-```bash
-[zed_wrapper-3] [INFO] [1729184874.634985183] [zed.zed_node]: === Starting Object Detection ===
-[zed_wrapper-3] [2024-10-17 17:07:55 UTC][ZED][INFO] Please wait while the AI model is being optimized for your graphics card
-[zed_wrapper-3]  This operation will be run only once and may take a few minutes 
-```
-
-You can find a detailed explanation of the Custom Object Detection module in the [ZED ROS 2 documentation](https://www.stereolabs.com/docs/ros2/custom-object-detection).
-
-### Body Tracking
-
-> :pushpin: **Note:** This feature is incompatible with the ZED X One and the older first-generation ZED cameras.
-
-The Body Tracking can be enabled *automatically* when the node starts by setting the parameter `body_tracking/bt_enabled` to `true` in the file `common_stereo.yaml`.
-
-### Spatial Mapping
-
-> :pushpin: **Note:** This feature is incompatible with the ZED X One camera.
-
-The Spatial Mapping can be enabled automatically when the node starts setting the parameter `mapping/mapping_enabled` to `true` in the file `common_stereo.yaml`.
-The Spatial Mapping can be enabled/disabled manually by calling the service `enable_mapping`.
-
-### GNSS fusion
-
-> :pushpin: **Note:** This feature is incompatible with the ZED X One camera.
-
-The ZED ROS 2 Wrapper can subscribe to a `NavSatFix` topic and fuse GNSS data information
-with Positional Tracking information to obtain a precise robot localization referred to Earth coordinates.
-To enable GNSS fusion, set the parameter `gnss_fusion.gnss_fusion_enabled` to `true`.
-You must set the correct `gnss_frame` parameter when launching the node, e.g., `gnss_frame:='gnss_link'`.
-The services `toLL` and `fromLL` can be used to convert Latitude/Longitude coordinates to robot `map` coordinates.
-
-### 2D mode
-
-> :pushpin: **Note:** This feature is incompatible with the ZED X One camera.
-
-For robots moving on a planar surface, activating the "2D mode" (parameter `pos_tracking/two_d_mode` in `common_stereo.yaml`) is possible.
-The value of the coordinate Z for odometry and pose will have a fixed value (parameter `pos_tracking/fixed_z_value` in `common_stereo.yaml`).
-Roll, Pitch, and the relative velocities will be fixed to zero.
-
-## NVIDIA® Isaac ROS integration
-
-The ZED ROS 2 Wrapper is compatible with the [NVIDIA® Isaac ROS](https://nvidia-isaac-ros.github.io/) framework, which provides a set of tools and libraries for building robotics applications on NVIDIA® platforms.
-
-The ZED ROS 2 Wrapper leverages [NITROS](https://nvidia-isaac-ros.github.io/concepts/nitros/index.html) (NVIDIA® Isaac Transport for ROS) a technology to enable data streaming through NVIDIA-accelerated ROS graphs.
-
-![NITROS communication](./images/nitros-graph.gif)
-
-Read the full [Isaac ROS integration guide](https://docs.stereolabs.com/isaac-ros/) and learn how to set up your development environment to use the ZED ROS2 Wrapper with Isaac ROS and NITROS.
-
-## Examples and Tutorials
-
-Examples and tutorials are provided to better understand how to use the ZED wrapper and how to integrate it into the ROS 2 framework.
-See the [`zed-ros2-examples` repository](https://github.com/stereolabs/zed-ros2-examples)
-
-### RVIZ2 visualization examples
-
-- Example launch files to start a preconfigured instance of RViz displaying all the ZED Wrapper node information: [zed_display_rviz2](https://github.com/stereolabs/zed-ros2-examples/tree/master/zed_display_rviz2)
-- ROS 2 plugin for ZED2 to visualize the results of the Object Detection and Body Tracking modules (bounding boxes and skeletons): [rviz-plugin-zed-od](https://github.com/stereolabs/zed-ros2-examples/tree/master/rviz-plugin-zed-od)
-
-### Tutorials
-
-A series of tutorials is provided to better understand how to use the ZED nodes in the ROS 2 environment :
-
-- [Video subscribing](https://github.com/stereolabs/zed-ros2-examples/tree/master/tutorials/zed_video_tutorial): `zed_video_tutorial` - In this tutorial, you will learn how to write a simple node that subscribes to messages of type `sensor_msgs/Image` to retrieve the Left and Right rectified images published by the ZED node.
-- [Depth subscribing](https://github.com/stereolabs/zed-ros2-examples/tree/master/tutorials/zed_depth_tutorial): `zed_depth_tutorial` - In this tutorial, you will learn how to write a simple node that subscribes to messages of type `sensor_msgs/Image` to retrieve the depth images published by the ZED node and to get the measured distance at the center of the image.
-- [Pose/Odometry subscribing](https://github.com/stereolabs/zed-ros2-examples/tree/master/tutorials/zed_pose_tutorial): `zed_pose_tutorial` - In this tutorial, you will learn how to write a simple node that subscribes to messages of type `geometry_msgs/PoseStamped` and `nav_msgs/Odometry` to retrieve the position and the odometry of the camera while moving in the world.
-- [ROS 2 Composition + BGRA2BGR conversion](https://github.com/stereolabs/zed-ros2-examples/tree/master/tutorials/zed_rgb_convert): `zed_rgb_convert` - In this tutorial, you will learn how to use the concept of "ROS 2 Composition" and "Intra Process Communication" to write a ROS 2 component that gets a 4 channel BGRA image as input and re-publishes it as 3 channels BGR image.
-- [ROS 2 Multi-Camera](https://github.com/stereolabs/zed-ros2-examples/tree/master/tutorials/zed_multi_camera): `zed_multi_camera` - In this tutorial, you will learn how to use the provided launch file to start a multi-camera robot configuration.
-- [ROS 2 Multi-Camera + Intra Process Communication](https://github.com/stereolabs/zed-ros2-examples/tree/master/tutorials/zed_ipc): `zed_ipc - In this tutorial, you will learn how to use the provided launch file to start a multi-camera configuration, and load a new processing node in the same process to leverage Intra Process Communication with ROS 2composition.
-- [Robot integration](https://github.com/stereolabs/zed-ros2-examples/tree/master/tutorials/zed_robot_integration): `zed_robot_integration` - In this tutorial, you will learn how to add one or more ZED cameras to a robot configuration.
-
-### Examples
-
-How to use the ZED ROS 2 nodes alongside other ROS 2 packages or advanced features.
-
-- [zed_aruco_localization](https://github.com/stereolabs/zed-ros2-examples/tree/master/examples/zed_aruco_localization): Use localized ArUco tag as a reference for localization.
-- [zed_depth_to_laserscan](https://github.com/stereolabs/zed-ros2-examples/tree/master/examples/zed_depth_to_laserscan): Convert ZED Depth maps into virtual Laser Scans using
-
-## Update the local repository
-
-To update the repository to the latest release, use the following command that will retrieve the latest commits of `zed-ros2-wrapper` and of all the submodules:
-
-```bash
-git checkout master # if you are not on the main branch  
-git pull 
-```
-
-Clean the cache of your colcon workspace before compiling with the `colcon build` command to be sure that everything will work as expected:
-
-```bash
-cd <ros2_workspace_root> # replace with your workspace folder, for example ~/ros2_ws/src/
-rm -r install
-rm -r build
-rm -r log
-colcon build --symlink-install --cmake-args=-DCMAKE_BUILD_TYPE=Release --parallel-workers $(nproc)
-```
-
-## Known issues
-
-- Nothing to report yet.
-
-If you find a bug or want to request a new feature, please open an issue on the [GitHub issues page](https://github.com/stereolabs/zed-ros2-wrapper/issues).
+This library is licensed under the MIT License.
