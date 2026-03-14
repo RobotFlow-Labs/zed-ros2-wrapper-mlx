@@ -96,3 +96,5 @@ CMakeLists.txt.user*
 
 # TMP folders
 docker/tmp_sources
+.cache/
+build/

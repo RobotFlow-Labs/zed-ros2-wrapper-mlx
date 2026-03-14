@@ -1,0 +1,280 @@
+# config/common_stereo_macos.yaml
+# Common parameters for Stereolabs ZED Stereo cameras on macOS / Apple Silicon
+#
+# ============================================================================
+# macOS / MLX FORK -- DIFFERENCES FROM UPSTREAM common_stereo.yaml
+# ============================================================================
+#
+# This file is based on the upstream common_stereo.yaml with the following
+# changes for the macOS + Apple Silicon + MLX port:
+#
+# 1. DEPTH MODE: Changed from 'NEURAL_LIGHT' to 'MLX'
+#    - The ZED SDK neural depth modes (NEURAL, NEURAL_LIGHT, NEURAL_PLUS)
+#      require CUDA, which is not available on macOS.
+#    - MLX depth uses Apple Silicon GPU-accelerated stereo matching via the
+#      zed-sdk-mlx library (~8ms per frame at 720p).
+#
+# 2. OBJECT DETECTION: Disabled (od_enabled: false)
+#    - Requires ZED SDK + CUDA inference engine. Not portable to macOS.
+#
+# 3. BODY TRACKING: Disabled (bt_enabled: false)
+#    - Requires ZED SDK + CUDA inference engine. Not portable to macOS.
+#
+# 4. SPATIAL MAPPING: Disabled (mapping_enabled: false)
+#    - Requires ZED SDK internal SLAM. Not portable to macOS.
+#
+# 5. POSITIONAL TRACKING: Disabled by default (pos_tracking_enabled: false)
+#    - Requires ZED SDK visual-inertial SLAM. Not portable to macOS.
+#    - Visual odometry via ORB-SLAM3 or similar is a future goal.
+#
+# 6. STREAMING SERVER: Disabled (stream_enabled: false)
+#    - Requires ZED SDK H.264/H.265 hardware encoder. Not portable.
+#
+# 7. GNSS FUSION: Disabled (gnss_fusion_enabled: false)
+#    - Depends on positional tracking, which is disabled.
+#
+# 8. CAMERA CONTROLS: Auto-only modes forced
+#    - macOS kernel UVC driver blocks USB class-specific control transfers.
+#    - Only auto_exposure_gain and auto_whitebalance are supported.
+#    - Manual exposure, gain, white balance, LED control are NOT available.
+#
+# 9. MLX PARAMETERS: New section for MLX stereo matching tuning
+#    - These parameters control the MLX GPU stereo disparity pipeline.
+#
+# 10. SIMULATION: Disabled (not relevant for macOS port)
+#
+# 11. REGION OF INTEREST: ROI for OD/BT/mapping disabled (those modules off)
+#
+# 12. ADVANCED THREADING: Changed to SCHED_OTHER (macOS default scheduler)
+#     - SCHED_BATCH, SCHED_FIFO, SCHED_RR are Linux-specific.
+#
+# ============================================================================
+
+---
+/**:
+    ros__parameters:
+        use_sim_time: false
+
+        simulation:
+            sim_enabled: false # Simulation mode not supported on macOS
+            sim_address: '127.0.0.1'
+            sim_port: 30000
+
+        svo:
+            use_svo_timestamps: true
+            publish_svo_clock: false
+            svo_loop: false
+            svo_realtime: false
+            play_from_frame: 0
+            replay_rate: 1.0
+
+        general:
+            camera_timeout_sec: 5
+            camera_max_reconnect: 5
+            camera_flip: false
+            self_calib: true
+            serial_number: 0 # overwritten by launch file
+            pub_resolution: 'CUSTOM'
+            pub_downscale_factor: 2.0
+            grab_compute_capping_fps: 0.0
+            pub_frame_rate: 15.0 # [DYNAMIC] Matched to MLX pipeline FPS ceiling (~14.5 FPS)
+            enable_image_validity_check: 1
+            gpu_id: -1 # Ignored on macOS -- MLX uses the unified Apple Silicon GPU
+            optional_opencv_calibration_file: ''
+            async_image_retrieval: false
+            publish_status: true
+
+        video:
+            saturation: 4 # [DYNAMIC]
+            sharpness: 4 # [DYNAMIC]
+            gamma: 8 # [DYNAMIC]
+            # ---- macOS FORCED: only auto modes are available ----
+            # The macOS kernel UVC driver blocks sideband USB control transfers.
+            # Manual exposure/gain/white-balance requires vendor XU register I/O
+            # which STALLs on macOS. These MUST remain true.
+            auto_exposure_gain: true # [FORCED ON macOS] Manual exposure/gain not available
+            exposure: 80 # [IGNORED on macOS] Only used if auto_exposure_gain is false
+            gain: 80 # [IGNORED on macOS] Only used if auto_exposure_gain is false
+            auto_whitebalance: true # [FORCED ON macOS] Manual white balance not available
+            whitebalance_temperature: 42 # [IGNORED on macOS] Only used if auto_whitebalance is false
+            enable_24bit_output: false
+            publish_rgb: true
+            publish_left_right: false
+            publish_raw: false
+            publish_gray: false
+            publish_stereo: false
+
+        sensors:
+            publish_imu_tf: true
+            sensors_image_sync: false # Uses timestamp-fallback sync on macOS (~2.5ms median offset)
+            sensors_pub_rate: 100.
+            publish_imu: true
+            publish_imu_raw: false
+            publish_cam_imu_transf: false
+            publish_mag: false
+            publish_baro: false
+            publish_temp: false
+
+        region_of_interest:
+            automatic_roi: false
+            depth_far_threshold_meters: 2.5
+            image_height_ratio_cutoff: 0.5
+            apply_to_depth: true
+            apply_to_positional_tracking: false # Pos tracking disabled on macOS
+            apply_to_object_detection: false # OD disabled on macOS
+            apply_to_body_tracking: false # BT disabled on macOS
+            apply_to_spatial_mapping: false # Mapping disabled on macOS
+            publish_roi_mask: false
+
+        depth:
+            depth_mode: 'MLX' # [macOS] Apple Silicon GPU stereo matching via zed-sdk-mlx
+            depth_stabilization: 0 # Disabled -- requires ZED SDK positional tracking
+            openni_depth_mode: false # 'false': 32bit float [meters], 'true': 16bit unsigned int [mm]
+            point_cloud_freq: 10.0 # [DYNAMIC]
+            point_cloud_res: 'COMPACT'
+            depth_confidence: 95 # [DYNAMIC]
+            depth_texture_conf: 100 # [DYNAMIC]
+            remove_saturated_areas: true # [DYNAMIC]
+            publish_depth_map: true
+            publish_depth_info: false
+            publish_point_cloud: true
+            publish_depth_confidence: false
+            publish_disparity: false
+
+        # ---- MLX Stereo Matching Parameters (macOS only) ----
+        # These control the Apple Silicon GPU-accelerated disparity pipeline
+        # from zed-sdk-mlx. Defaults match the "live" preset that achieves
+        # ~8ms MLX compute at 720p.
+        #
+        # Tuning guide:
+        #   - Increase window_size for smoother depth (costs FPS)
+        #   - Increase max_disparity for closer objects (costs memory)
+        #   - Set refinement_radius > 0 for sub-pixel accuracy (costs FPS)
+        #   - Lower processing_scale for faster compute (less detail)
+        #   - consistency_mode 'lr' enables left-right consistency check
+        mlx:
+            pyramid_factor: 2 # Downscale factor for coarse-to-fine matching
+            window_size: 5 # Stereo matching window size (pixels)
+            refinement_radius: 0 # Sub-pixel refinement radius (0 = disabled for speed)
+            max_disparity: 96 # Maximum disparity search range (pixels)
+            processing_scale: 0.75 # Input downscale before matching (1.0 = full res)
+            consistency_mode: 'none' # 'none' or 'lr' (left-right consistency check)
+
+        pos_tracking:
+            pos_tracking_enabled: false # [DISABLED on macOS] Requires ZED SDK visual-inertial SLAM
+            pos_tracking_mode: 'GEN_1'
+            imu_fusion: true
+            publish_tf: true
+            publish_map_tf: false # Map TF disabled since pos tracking is off
+            map_frame: 'map'
+            odometry_frame: 'odom'
+            area_memory: false # Requires ZED SDK SLAM
+            area_file_path: ''
+            enable_localization_only: false
+            save_area_memory_on_closing: false
+            reset_odom_with_loop_closure: false
+            publish_3d_landmarks: false
+            publish_lm_skip_frame: 5
+            depth_min_range: 0.0
+            set_as_static: false
+            set_gravity_as_origin: true
+            floor_alignment: false
+            initial_base_pose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+            path_pub_rate: 2.0
+            path_max_count: -1
+            two_d_mode: false
+            fixed_z_value: 0.0
+            transform_time_offset: 0.0
+            reset_pose_with_svo_loop: true
+            publish_odom_pose: false # Disabled since pos tracking is off
+            publish_pose_cov: false
+            publish_cam_path: false
+
+        gnss_fusion:
+            gnss_fusion_enabled: false # [DISABLED on macOS] Depends on pos tracking
+            gnss_fix_topic: '/fix'
+            gnss_zero_altitude: false
+            h_covariance_mul: 1.0
+            v_covariance_mul: 1.0
+            publish_utm_tf: false
+            broadcast_utm_transform_as_parent_frame: false
+            enable_reinitialization: false
+            enable_rolling_calibration: false
+            enable_translation_uncertainty_target: false
+            gnss_vio_reinit_threshold: 5.0
+            target_translation_uncertainty: 0.1
+            target_yaw_uncertainty: 0.1
+
+        mapping:
+            mapping_enabled: false # [DISABLED on macOS] Requires ZED SDK spatial mapping
+            resolution: 0.05
+            max_mapping_range: 5.0
+            fused_pointcloud_freq: 1.0
+            clicked_point_topic: '/clicked_point'
+            pd_max_distance_threshold: 0.15
+            pd_normal_similarity_threshold: 15.0
+            publish_det_plane: false
+
+        object_detection:
+            od_enabled: false # [DISABLED on macOS] Requires CUDA inference engine
+            enable_tracking: false
+            detection_model: 'MULTI_CLASS_BOX_FAST'
+            max_range: 20.0
+            filtering_mode: 'NMS3D'
+            prediction_timeout: 2.0
+            allow_reduced_precision_inference: false
+
+        body_tracking:
+            bt_enabled: false # [DISABLED on macOS] Requires CUDA inference engine
+            model: 'HUMAN_BODY_MEDIUM'
+            body_format: 'BODY_38'
+            allow_reduced_precision_inference: false
+            max_range: 15.0
+            body_kp_selection: 'FULL'
+            enable_body_fitting: false
+            enable_tracking: false
+            prediction_timeout_s: 0.5
+            confidence_threshold: 50.0
+            minimum_keypoints_threshold: 5
+
+        stream_server:
+            stream_enabled: false # [DISABLED on macOS] Requires ZED SDK H.264/H.265 encoder
+            codec: 'H265'
+            port: 30000
+            bitrate: 12500
+            gop_size: -1
+            adaptative_bitrate: false
+            chunk_size: 16084
+            target_framerate: 0
+
+        advanced:
+            # macOS uses SCHED_OTHER (the only portable policy).
+            # SCHED_BATCH, SCHED_FIFO, SCHED_RR are Linux-specific.
+            thread_sched_policy: 'SCHED_OTHER'
+            thread_grab_priority: 50
+            thread_sensor_priority: 70
+            thread_pointcloud_priority: 60
+
+        debug:
+            sdk_verbose: 1
+            sdk_verbose_log_file: ''
+            use_pub_timestamps: false
+            debug_common: false
+            debug_grab: false
+            debug_sim: false
+            debug_video_depth: false
+            debug_camera_controls: false
+            debug_point_cloud: false
+            debug_tf: false
+            debug_positional_tracking: false
+            debug_gnss: false
+            debug_sensors: false
+            debug_mapping: false
+            debug_terrain_mapping: false
+            debug_object_detection: false
+            debug_body_tracking: false
+            debug_roi: false
+            debug_streaming: false
+            debug_advanced: false
+            debug_nitros: false
+            disable_nitros: true # NITROS is NVIDIA-specific, always disabled on macOS

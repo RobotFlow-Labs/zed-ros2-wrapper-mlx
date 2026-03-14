@@ -1,0 +1,43 @@
+# config/zed2i_macos.yaml
+# Parameters for Stereolabs ZED 2i camera on macOS / Apple Silicon
+#
+# ============================================================================
+# macOS / MLX FORK -- DIFFERENCES FROM UPSTREAM zed2i.yaml
+# ============================================================================
+#
+# 1. RESOLUTION: Changed from HD1080 to HD720
+#    - HD720 (1280x720) is the optimal resolution for the MLX stereo pipeline.
+#    - At HD720 the MLX compute is ~8ms per frame on Apple Silicon.
+#    - HD1080 works but drops to ~6 FPS with full pipeline overhead.
+#
+# 2. FRAME RATE: Changed from 30 to 15
+#    - The live pipeline ceiling is ~14.5 FPS at 720p (bottleneck is Python/
+#      OpenCV display, not MLX compute).
+#    - Setting grab_frame_rate to 15 avoids wasting USB bandwidth on frames
+#      that will be dropped by the processing pipeline.
+#    - When running headless (no display), you can increase this to 30.
+#
+# 3. DEPTH RANGE: Adjusted for MLX characteristics
+#    - min_depth: 0.3m (MLX disparity is less reliable at very close range
+#      due to max_disparity=96 at 720p)
+#    - max_depth: 10.0m (conservative for MLX; accuracy degrades beyond this)
+#
+# ============================================================================
+
+---
+/**:
+    ros__parameters:
+        general:
+            camera_model: 'zed2i'
+            camera_name: 'zed2i' # overwritten by launch file
+            grab_resolution: 'HD720' # [macOS] Optimal for MLX pipeline (~8ms compute)
+            grab_frame_rate: 15 # [macOS] Matches MLX live pipeline ceiling (~14.5 FPS)
+
+        video:
+            brightness: 4 # [DYNAMIC] Image brightness. Range: 0-8
+            contrast: 4 # [DYNAMIC] Image contrast. Range: 0-8
+            hue: 0 # [DYNAMIC] Image hue. Range: 0 to 11
+
+        depth:
+            min_depth: 0.3 # [macOS] MLX min reliable depth at 720p with max_disparity=96
+            max_depth: 10.0 # [macOS] MLX accuracy degrades beyond ~10m at 720p

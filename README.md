@@ -10,6 +10,78 @@
 
 <hr>
 
+## macOS / Apple Silicon / MLX Fork
+
+> **This is the macOS port** of the [zed-ros2-wrapper](https://github.com/stereolabs/zed-ros2-wrapper).
+> It replaces the ZED SDK's CUDA-based depth with [MLX](https://github.com/ml-explore/mlx) stereo matching
+> on Apple Silicon and disables features that require CUDA or ZED SDK internals.
+> The capture layer is provided by [zed-sdk-mlx](https://github.com/RobotFlow-Labs/zed-sdk-mlx).
+
+### Quick Start (macOS)
+
+```bash
+# Prerequisites: macOS 13+, Apple Silicon, Homebrew, ROS 2 (via robostack or source)
+brew install cmake hidapi opencv
+
+# Set up workspace
+mkdir -p ~/ros2_ws/src && cd ~/ros2_ws/src
+git clone https://github.com/RobotFlow-Labs/zed-ros2-wrapper-mlx.git
+git clone https://github.com/RobotFlow-Labs/zed-sdk-mlx.git
+
+# Build
+cd ~/ros2_ws
+rosdep install --from-paths src --ignore-src -r -y
+colcon build --symlink-install --cmake-args=-DCMAKE_BUILD_TYPE=Release --packages-skip zed_debug
+source install/local_setup.bash
+
+# Launch (ZED 2i, 720p, MLX depth)
+ros2 launch zed_wrapper zed_camera_macos.launch.py
+```
+
+### Port Status
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Stereo video capture | Available | AVFoundation backend via zed-sdk-mlx |
+| MLX depth / point cloud | Available | ~8ms compute at 720p on Apple Silicon |
+| IMU / magnetometer / barometer | Available | hidapi (same as Linux) |
+| Stereo rectification | Available | OpenCV (same as Linux) |
+| Camera controls | Partial | Auto mode only (macOS kernel blocks XU controls) |
+| Positional tracking / SLAM | Not available | Requires ZED SDK internals |
+| Object detection | Not available | Requires CUDA inference |
+| Body tracking | Not available | Requires CUDA inference |
+| Spatial mapping | Not available | Requires ZED SDK internals |
+| Streaming server | Not available | Requires ZED SDK H.264/H.265 encoder |
+| GNSS fusion | Not available | Depends on positional tracking |
+| Simulation mode | Not available | Requires ZED SDK simulation bridge |
+| NITROS integration | Not available | NVIDIA-specific |
+
+### macOS Configuration Files
+
+| File | Purpose |
+|------|---------|
+| [`common_stereo_macos.yaml`](zed_wrapper/config/common_stereo_macos.yaml) | Common params with MLX depth, disabled CUDA features |
+| [`zed2i_macos.yaml`](zed_wrapper/config/zed2i_macos.yaml) | ZED 2i at HD720 @ 15fps (optimal for MLX) |
+| [`zed_camera_macos.launch.py`](zed_wrapper/launch/zed_camera_macos.launch.py) | Simplified launch for macOS (no OD/BT/sim) |
+
+### Performance (ZED 2i, 720p, Apple Silicon)
+
+| Metric | Value |
+|--------|-------|
+| MLX compute per frame | ~8 ms |
+| Live pipeline (with display) | ~69 ms (~14.5 FPS) |
+| Configured grab rate | 15 FPS |
+
+For the full architecture, non-portable feature analysis, and topic comparison, see [`porting_plan.md`](./porting_plan.md).
+
+---
+
+## Upstream Documentation
+
+> Everything below is the original upstream README for the Linux/CUDA version.
+
+<hr>
+
 This package enables the use of ZED cameras with ROS 2, providing access to a variety of data types, including:
 
 - Color and grayscale images, both rectified and unrectified

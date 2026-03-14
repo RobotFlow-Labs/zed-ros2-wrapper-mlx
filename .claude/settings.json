@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(*)",
+      "Read(*)",
+      "Write(*/stereolabs/*)",
+      "Write(/Users/ilessio/.claude/*)",
+      "Edit(*/stereolabs/*)",
+      "Glob(*)",
+      "Grep(*)",
+      "Agent(*)"
+    ],
+    "deny": [
+      "Bash(rm -rf /)*",
+      "Bash(sudo *)",
+      "Bash(curl * | bash*)",
+      "Bash(wget * | bash*)",
+      "Write(/etc/*)",
+      "Write(/usr/*)",
+      "Write(/System/*)"
+    ]
+  }
+}
